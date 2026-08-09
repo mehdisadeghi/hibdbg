@@ -14,12 +14,6 @@ die() { echo "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || echo "note: not root; privileged steps fail if unpermitted" >&2
 
-# a help request anywhere drops to the usage block instead of being eaten
-# as a subcommand argument
-for a in "$@"; do
-	case "$a" in -h|--help|help) set --; break ;; esac
-done
-
 num() { case "$1" in ''|*[!0-9]*) die "$2: expected a number, got '$1'" ;; esac; }
 
 denoise() { grep -vE 'ppid:[0-9]+\(syno_hibernatio' || true; }
@@ -121,6 +115,266 @@ ringsample() {
 	systemctl start syslog-ng
 	trap - EXIT
 }
+
+usage() { cat <<USAGE
+usage: hibdbg <cmd> [args]        hibdbg <cmd> --help for detail
+ discovery
+  map                 device topology
+  audit               status of disk-writing DSM components + tunables
+  sched               crontab, synocrond jobs, smart schedules
+ tracing (writes to md0 itself; prefer md0/md0files for system-side)
+  on|off              toggle block-dump tracing
+  hdd [min]           HDD-volume offenders from $LOG
+  sys [min]           system-partition offenders from $LOG
+  raw PAT [min]       custom device pattern
+  tree [min]          parent -> child of HDD writers
+  files PROC [min]    paths PROC dirtied
+  when PROC [min]     wallclock timestamps (spot periodicity)
+ feedback-free (pauses syslog-ng during sample)
+  md0 [sec]           system-partition writers via ring buffer (def 120)
+  md0files [sec]      dirtied paths on md0
+  who [devpat] [sec]  writers + dirtied paths on any devices (def all, 60s)
+ ground truth
+  live [sec]          diskstats delta (def 10)
+  rq [sec]            every sata queue request incl. passthrough (def 120)
+  pollwho [sec] [comm]  parent chain of short-lived helper spawns (def sg_raw)
+  state               HDD power state (non-waking)
+  smb / nfs           client sessions
+ mitigation
+  quiesce             stop+disable index daemons, purge stale queues
+  unquiesce           re-enable indexing
+  hib [min|undo]      show hibernation keys / set standbytimer / undo
+  hiblog [n]          scemd hibernation decisions / wake reasons (def 40)
+  hibdebug on|off     DSM hibernation debug logging (safe post-sysmig)
+  sysmig              migrate md0/md1 system arrays HDD -> NVMe (re-run until done)
+  pollshim on|off|status  cache scemd SCT polls while drives sleep (no wake)
+  sleepd start|stop|status [min]  DIY standby daemon (needs pollshim)
+  boot                idempotent boot task: pollshim on + sysmig + sleepd start
+  calm [sec]          batch md0 journal+writeback (def 600s); print persist hint
+  uncalm              restore defaults
+  calm3 [sec]         batch volume3 btrfs commits (def 600s)
+  uncalm3             restore volume3 commit=30s
+ tracer-free attribution
+  logs [sec]          /var/log file growth + tails (def 120s); finds chatty services
+  fresh [min] [path]  files modified in last MIN min (def 10, /volume3)
+ long recording
+  rec [sec]           background all-instrument recorder (def 4h), survives
+                      logout; writes <scriptdir>/hibdbg.rec.<ts>/
+  recstop             stop the latest recording
+  recsum DIR          summarize a recording (episodes, states, attribution)
+  recwakes DIR        per-wake table: duration, I/O, what woke it
+  recwho DIR COMM     parent chains for COMM execs in a recording
+ one-shot
+  sleepnow [sec] [nopoll]  force standby, report wakes; nopoll stops scemd
+                      (SCT temp polls off, fans hold speed) for the window
+  probe               live + state + md0 trace + lcc delta, with verdict key
+  rootspace           md0 space breakdown (what filled the system partition)
+  lcc [sec]           SMART load-cycle counters; with SEC show delta (non-waking)
+  disks               model/serial/firmware per drive (non-waking)
+USAGE
+}
+
+# hibdbg <cmd> --help. Commands whose behaviour needs more than the one-line
+# summary get a block here; the rest fall back to their line in usage().
+help_cmd() {
+	case "$1" in
+	rec) cat <<'EOF'
+usage: hibdbg rec [sec]                                        (default 14400)
+
+Detached all-instrument recorder; survives ssh logout (setsid). Writes into
+<scriptdir>/hibdbg.rec.<timestamp>/ -- keep the script on an SSD volume, never
+on the drives under test, and never on / (md0 is 8G; see rootspace).
+
+  block.log      sata queue requests, incl. ATA passthrough  (uncompressed)
+  fork.log.gz    fork/exec graph, the bulk of the data       (~3G/day)
+  blockdump.log  process + dirtied-path attribution, HDD stack only
+  diskstats.log  30s I/O snapshots        state.log  30s power state
+  meta           start/end, device numbers, block_dump pattern
+
+syslog-ng stays stopped for the whole recording (its writes would be measured
+as disk activity). Run only one block_dump-family and one tracepoint-family
+instrument at a time; concurrent recorders starve each other's traces.
+
+A full day is the shortest run that separates scheduled wakes from real use.
+Analyze with recwakes (per-wake attribution), recsum (raw timeline), recwho.
+EOF
+	;;
+	recwakes) cat <<'EOF'
+usage: hibdbg recwakes DIR
+
+One block per wake episode: wake -> sleep time, duration, total sata reads and
+writes, then the top processes and dirtied paths from the FIRST 15 MINUTES.
+
+That cutoff is the point of the command. Only the opening minutes identify
+what woke the drive; everything later is unrelated work piggybacking on an
+already-spinning disk, which is what makes a raw timeline unreadable.
+
+Reads state.log, diskstats.log and blockdump.log; needs no root. Timing rides
+the 30s sample grid rather than date arithmetic (DSM's date may lack -d).
+
+Avoidable vs legitimate is your call: nfsd/smbd reads in the opening window are
+your own access; synosharesnapsh, synoretainer, synostgreclaim, btrfs-transacti
+on a backup .tmp file are scheduled jobs you can retime or relocate.
+EOF
+	;;
+	recsum) cat <<'EOF'
+usage: hibdbg recsum DIR
+
+Flat summary of a recording: every 30s interval in which sata counters moved,
+drive state transitions, aggregated block_dump processes and dirtied paths,
+queue requests by issuer, and the storage helpers that were exec'd.
+
+Use recwakes first -- it attributes each wake. recsum is the raw view for when
+you already know which episode you care about. Needs no root.
+EOF
+	;;
+	recwho) cat <<'EOF'
+usage: hibdbg recwho DIR COMM
+
+Parent chains for every exec of COMM in a recording: grandparent -> parent ->
+COMM, aggregated by frequency. Names the daemon behind millisecond-lived
+helpers (sg_raw, cryptsetup, ffprobe) that /proc sampling can never catch.
+
+Streams the compressed fork graph in three passes (exec pids, their forks,
+grandparents), so a day-long recording takes minutes, not hours. No root.
+EOF
+	;;
+	recstop) cat <<'EOF'
+usage: hibdbg recstop
+
+Stops the most recent recording under the script's directory: disarms the
+tracepoints, clears block_dump, and restarts syslog-ng. Always use this rather
+than killing the process, or syslog-ng stays stopped and tracing stays armed.
+EOF
+	;;
+	rootspace) cat <<'EOF'
+usage: hibdbg rootspace
+
+Breakdown of the 8G system partition (md0): top-level directories, files over
+50M, /var/log sizes, recordings, and leftover tracing state.
+
+Run this when DSM reports "the free space of system partition is insufficient"
+on a package update. Usual causes are a recording left in /root and /var/log
+grown by block_dump lines after a recorder died without clearing it.
+EOF
+	;;
+	sleepnow) cat <<'EOF'
+usage: hibdbg sleepnow [sec] [nopoll]                           (default 300)
+
+Acceptance test for the whole stack. Syncs, waits out the ext4 and btrfs commit
+intervals, issues hdparm -y to every HDD, then samples for SEC seconds at 5s
+grain: diskstats timeline, block_dump attribution, and a queue-level trace that
+includes passthrough. Does not stop at the first wake.
+
+Pass "nopoll" as the second argument to stop scemd for the window: SCT
+temperature polls cease and fans hold their speed. That is the A/B that proved
+the polls themselves wake a manually-slept drive.
+
+syslog-ng is paused for the window. Do not run other hibdbg commands meanwhile.
+EOF
+	;;
+	sleepd) cat <<'EOF'
+usage: hibdbg sleepd start|stop|status [min]
+
+DIY standby daemon with hd-idle semantics: watches /proc/diskstats and issues
+hdparm -y per drive after MIN idle minutes. Without MIN it tracks synoinfo's
+standbytimer live, re-reading it every cycle, so hib MIN takes effect without a
+restart. DSM's own idle timer never fires on this box (NVMe pool activity
+vetoes it), which is why this exists.
+
+Refuses to start, and exits if the shim disappears, unless pollshim is
+installed: scemd's polls would wake the drives right back and the pair would
+churn start/stop cycles. Reverted at boot -- see boot.
+EOF
+	;;
+	pollshim) cat <<'EOF'
+usage: hibdbg pollshim on|off|status
+
+Wraps /usr/syno/bin/sg_raw (original kept as sg_raw.real). While a drive is in
+standby, SCT status reads (ATA PASS-THROUGH, CDB byte 2f) are answered from a
+cached response instead of being passed to the disk; every other command goes
+straight through. scemd issues those reads every 10-20s and each one spins a
+sleeping drive back up -- without this, standby cannot hold.
+
+The standby test is hdparm -C, which does not itself wake the drive. "on" is
+idempotent. DSM restores the stock binary at every boot; "status" reports the
+install state and cache hits, and audit shows it too.
+EOF
+	;;
+	sysmig) cat <<'EOF'
+usage: hibdbg sysmig
+
+Migrates the DSM system arrays (md0 = /, md1 = swap) off the HDDs onto the
+NVMe drives, one safe step per run -- re-run until it reports done. Adds the
+NVMe system partitions, waits for resync, then fails and removes the sata
+members and shrinks the arrays to two devices.
+
+DSM mirrors its OS onto every data drive, so the root filesystem alone keeps
+the HDDs awake regardless of which userspace writers you silence. After this,
+Storage Manager permanently shows "system partition failed" on BOTH HDDs: that
+is the correct state, and Repair undoes the migration. See SYSMIG.md.
+EOF
+	;;
+	boot) cat <<'EOF'
+usage: hibdbg boot
+
+Re-asserts the whole stack, idempotently: pollshim on, sysmig, sleepd start.
+
+DSM reverts the wrapper binary and re-adds the HDD members to md0/md1 at every
+boot, not just across updates. Register this as a Task Scheduler triggered
+task (Boot-up, user root) or the stack silently degrades after any reboot.
+EOF
+	;;
+	hib) cat <<'EOF'
+usage: hibdbg hib [MIN|undo]
+
+No argument shows the hibernation-related keys from scemd.xml and both
+synoinfo.conf files. MIN sets standbytimer (minutes), recording the previous
+value so undo can restore it, and restarts scemd. sleepd picks the new value
+up on its next cycle, no restart needed.
+
+This sets the idle threshold only. DSM's native hibernation still will not
+fire on this box; standby comes from sleepd.
+EOF
+	;;
+	who) cat <<'EOF'
+usage: hibdbg who [devpat] [sec]                        (default all, 60s)
+
+Feedback-free attribution: arms block_dump, pauses syslog-ng so the tracing
+does not generate the disk writes it is measuring, samples the kernel ring for
+SEC seconds, then reports writers and dirtied paths. devpat is an extended
+regex over device names (e.g. "dm-3|md4|sata1").
+
+Note that block_dump cannot see SG_IO/ATA passthrough -- use rq for that.
+EOF
+	;;
+	rq) cat <<'EOF'
+usage: hibdbg rq [sec]                                         (default 120)
+
+Every request that reaches a sata queue, via the block:block_rq_issue
+tracepoint, with issuing process and CDB bytes. This is the only instrument
+that sees ATA passthrough: the SCT temperature polls are invisible to both
+block_dump and diskstats, and they are what defeats standby.
+
+Blocks for SEC seconds. Filtered to sata devices by kernel dev_t.
+EOF
+	;;
+	*)	usage | grep -E "^  $1( |\||\$)" \
+			|| die "unknown command: $1 (hibdbg --help for the list)" ;;
+	esac
+}
+
+# "hibdbg <cmd> --help" documents that command; "--help" alone lists them all
+for a in "$@"; do
+	case "$a" in
+	-h|--help|help)
+		case "$1" in
+		-h|--help|help) usage ;;
+		*) help_cmd "$1" ;;
+		esac
+		exit 0 ;;
+	esac
+done
 
 case "${1:-}" in
 
@@ -880,61 +1134,5 @@ rootspace)
 	echo "block_dump=$(cat /proc/sys/vm/block_dump)"
 	pgrep -af 'hibdbg.*_rec|cat.*trace_pipe' || echo "no stray recorder processes" ;;
 
-*)	cat <<USAGE
-usage: hibdbg <cmd>
- discovery
-  map                 device topology
-  audit               status of disk-writing DSM components + tunables
-  sched               crontab, synocrond jobs, smart schedules
- tracing (writes to md0 itself; prefer md0/md0files for system-side)
-  on|off              toggle block-dump tracing
-  hdd [min]           HDD-volume offenders from $LOG
-  sys [min]           system-partition offenders from $LOG
-  raw PAT [min]       custom device pattern
-  tree [min]          parent -> child of HDD writers
-  files PROC [min]    paths PROC dirtied
-  when PROC [min]     wallclock timestamps (spot periodicity)
- feedback-free (pauses syslog-ng during sample)
-  md0 [sec]           system-partition writers via ring buffer (def 120)
-  md0files [sec]      dirtied paths on md0
-  who [devpat] [sec]  writers + dirtied paths on any devices (def all, 60s)
- ground truth
-  live [sec]          diskstats delta (def 10)
-  rq [sec]            every sata queue request incl. passthrough (def 120)
-  pollwho [sec] [comm]  parent chain of short-lived helper spawns (def sg_raw)
-  state               HDD power state (non-waking)
-  smb / nfs           client sessions
- mitigation
-  quiesce             stop+disable index daemons, purge stale queues
-  unquiesce           re-enable indexing
-  hib [min|undo]      show hibernation keys / set standbytimer / undo
-  hiblog [n]          scemd hibernation decisions / wake reasons (def 40)
-  hibdebug on|off     DSM hibernation debug logging (safe post-sysmig)
-  sysmig              migrate md0/md1 system arrays HDD -> NVMe (re-run until done)
-  pollshim on|off|status  cache scemd SCT polls while drives sleep (no wake)
-  sleepd start|stop|status [min]  DIY standby daemon (needs pollshim)
-  boot                idempotent boot task: pollshim on + sysmig + sleepd start
-  calm [sec]          batch md0 journal+writeback (def 600s); print persist hint
-  uncalm              restore defaults
-  calm3 [sec]         batch volume3 btrfs commits (def 600s)
-  uncalm3             restore volume3 commit=30s
- tracer-free attribution
-  logs [sec]          /var/log file growth + tails (def 120s); finds chatty services
-  fresh [min] [path]  files modified in last MIN min (def 10, /volume3)
- long recording
-  rec [sec]           background all-instrument recorder (def 4h), survives
-                      logout; writes <scriptdir>/hibdbg.rec.<ts>/
-  recstop             stop the latest recording
-  recsum DIR          summarize a recording (episodes, states, attribution)
-  recwakes DIR        per-wake table: duration, I/O, what woke it
-  recwho DIR COMM     parent chains for COMM execs in a recording
- one-shot
-  sleepnow [sec] [nopoll]  force standby, report wakes; nopoll stops scemd
-                      (SCT temp polls off, fans hold speed) for the window
-  probe               live + state + md0 trace + lcc delta, with verdict key
-  rootspace           md0 space breakdown (what filled the system partition)
-  lcc [sec]           SMART load-cycle counters; with SEC show delta (non-waking)
-  disks               model/serial/firmware per drive (non-waking)
-USAGE
-	;;
+*)	usage ;;
 esac

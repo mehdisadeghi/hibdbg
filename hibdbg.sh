@@ -14,6 +14,14 @@ die() { echo "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || echo "note: not root; privileged steps fail if unpermitted" >&2
 
+# a help request anywhere drops to the usage block instead of being eaten
+# as a subcommand argument
+for a in "$@"; do
+	case "$a" in -h|--help|help) set --; break ;; esac
+done
+
+num() { case "$1" in ''|*[!0-9]*) die "$2: expected a number, got '$1'" ;; esac; }
+
 denoise() { grep -vE 'ppid:[0-9]+\(syno_hibernatio' || true; }
 
 recent() {
@@ -437,7 +445,7 @@ rec)	# hibdbg rec [sec]: all-instrument background recorder; survives ssh
 	#   fork.log.gz    fork/exec graph (bulk; ~3G/day gzipped)
 	#   diskstats.log  30s diskstats snapshots   state.log  30s power state
 	# syslog-ng is stopped for the whole recording. Analyze: recsum DIR
-	dur=${2:-14400}
+	dur=${2:-14400}; num "$dur" "rec [sec]"
 	d="$RECBASE/hibdbg.rec.$(date +%Y%m%d-%H%M%S)"
 	mkdir "$d"
 	setsid "$0" _rec "$dur" "$d" >/dev/null 2>&1 < /dev/null &
@@ -702,6 +710,7 @@ sleepd)	# hibdbg sleepd start|stop|status [min]: DIY standby daemon (hd-idle
 		if pgrep -f 'hibdbg.sh _sleepd' >/dev/null; then
 			echo "already running"; exit 0
 		fi
+		[ -z "${3:-}" ] || num "$3" "sleepd start [min]"
 		setsid "$0" _sleepd "${3:-}" >/dev/null 2>&1 < /dev/null &
 		if [ -n "${3:-}" ]; then
 			echo "sleepd started (idle ${3}m fixed -> standby)"
@@ -784,7 +793,7 @@ hib)	# hibdbg hib        -> show hibernation config (timer = synoinfo.conf)
 sleepnow) # hibdbg sleepnow [sec]: force standby, record full wake timeline
 	# with kernel-attributed events. syslog-ng paused for the window
 	# (trace must not persist to md0). Do not run other commands meanwhile.
-	dur=${2:-300}
+	dur=${2:-300}; num "$dur" "sleepnow [sec]"
 	nopoll=${3:-}
 	t0=$(awk '{print $1}' /proc/uptime)
 	systemctl stop syslog-ng

@@ -17,9 +17,14 @@ on any DSM 7.x box. Run as root on the NAS.
 
     sudo ./hibdbg.sh                 # full command reference
     sudo ./hibdbg.sh audit           # component + writer status
-    sudo ./hibdbg.sh rec 14400       # hours-long background recorder
+    sudo ./hibdbg.sh rec 86400       # day-long background recorder
     sudo ./hibdbg.sh recsum DIR      # episode timeline + attribution
+    sudo ./hibdbg.sh recwakes DIR    # per-wake: duration, I/O, what woke it
     sudo ./hibdbg.sh sleepnow 120    # forced-standby acceptance test
+    sudo ./hibdbg.sh rootspace       # what is filling the 8G system partition
+
+Recordings land next to the script — keep it on an SSD volume, not on the
+drives under test.
 
 Mitigation stack (see GUIDE.md for the reasoning):
 

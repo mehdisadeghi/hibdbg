@@ -2,8 +2,13 @@
 # hibdbg - find and silence what keeps Synology disks awake. Run as root.
 set -eu
 
+# sudo PATH on DSM lacks /usr/bin (pgrep, etc.)
+export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+
 LOG=/var/log/hibernationFull.log
 DEF_MIN=60
+# recordings must not land on md0 (8G, fills up); home sits on a volume
+RECBASE=$(dirname "$(readlink -f "$0")")
 
 die() { echo "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
@@ -425,13 +430,14 @@ unquiesce)
 	echo "indexing restored" ;;
 
 rec)	# hibdbg rec [sec]: all-instrument background recorder; survives ssh
-	# logout (setsid). Collects into /root/hibdbg.rec.<ts>/ :
+	# logout (setsid). Collects into $RECBASE/hibdbg.rec.<ts>/ :
 	#   blockdump.log  block_dump events on the HDD stack (proc + paths)
-	#   trace.log      block_rq_issue (sata, incl passthrough) + fork/exec
+	#   block.log      block_rq_issue (sata, incl passthrough)
+	#   fork.log.gz    fork/exec graph (bulk; ~3G/day gzipped)
 	#   diskstats.log  30s diskstats snapshots   state.log  30s power state
 	# syslog-ng is stopped for the whole recording. Analyze: recsum DIR
 	dur=${2:-14400}
-	d="/root/hibdbg.rec.$(date +%Y%m%d-%H%M%S)"
+	d="$RECBASE/hibdbg.rec.$(date +%Y%m%d-%H%M%S)"
 	mkdir "$d"
 	setsid "$0" _rec "$dur" "$d" >/dev/null 2>&1 < /dev/null &
 	echo "recording ${dur}s -> $d"
@@ -468,7 +474,9 @@ _rec)	dur=$2; d=$3
 	echo 1 > "$T/events/block/block_rq_issue/enable"
 	echo 1 > "$T/events/sched/sched_process_fork/enable"
 	echo 1 > "$T/events/sched/sched_process_exec/enable"
-	cat "$T/trace_pipe" > "$d/trace.log" & tp=$!
+	# killing cat (not gzip) lets the pipeline flush and close cleanly
+	cat "$T/trace_pipe" > >(tee >(grep --line-buffered block_rq_issue > "$d/block.log") \
+		| grep -v block_rq_issue | gzip > "$d/fork.log.gz") & tp=$!
 	dmesg -c >/dev/null 2>&1 || true
 	echo 1 > /proc/sys/vm/block_dump
 	end=$(( $(date +%s) + dur )); i=0
@@ -488,12 +496,25 @@ _rec)	dur=$2; d=$3
 		  done; } >> "$d/state.log"
 	done ;;
 
-recwho)	# hibdbg recwho DIR COMM: parent chains for COMM execs in a recording
-	d=${2:?usage: hibdbg recwho DIR COMM}
-	forkchain "$d/trace.log" "${3:?comm}" ;;
+recwho)	# hibdbg recwho DIR COMM: parent chains for COMM execs in a recording.
+	# fork.log.gz is too big to grep per-pid; extract the COMM-relevant
+	# slice in 3 streaming passes, then run forkchain on the extract.
+	d=${2:?usage: hibdbg recwho DIR COMM}; c=${3:?comm}
+	ex=$(zcat -q "$d/fork.log.gz" | grep sched_process_exec | grep "$c" || true)
+	[ -n "$ex" ] || die "no $c exec in $d"
+	pat=$(echo "$ex" | sed -E 's/.* pid=([0-9]+).*/\1/' | sort -u | paste -sd'|' -)
+	pf=$(zcat -q "$d/fork.log.gz" \
+		| grep -E "sched_process_fork.*child_pid=($pat)( |\$)" || true)
+	gpat=$(echo "$pf" | sed -E 's/.*comm=[^ ]+ pid=([0-9]+).*/\1/' | sort -u | paste -sd'|' -)
+	gf=$([ -n "$gpat" ] && zcat -q "$d/fork.log.gz" \
+		| grep -E "sched_process_fork.*child_pid=($gpat)( |\$)" || true)
+	tmp=$(mktemp)
+	printf '%s\n%s\n%s\n' "$ex" "$pf" "$gf" > "$tmp"
+	forkchain "$tmp" "$c"
+	rm -f "$tmp" ;;
 
-recstop) d=$(ls -dt /root/hibdbg.rec.*/ 2>/dev/null | head -1)
-	[ -n "$d" ] || die "no recordings under /root"
+recstop) d=$(ls -dt "$RECBASE"/hibdbg.rec.*/ 2>/dev/null | head -1)
+	[ -n "$d" ] || die "no recordings under $RECBASE"
 	kill "$(cat "${d}pid")" 2>/dev/null && echo "stopped ${d%/}" \
 		|| echo "not running (${d%/})" ;;
 
@@ -513,14 +534,57 @@ recsum)	d=${2:?usage: hibdbg recsum DIR}
 	echo "== dirtied paths =="
 	grep -v '^== ' "$d/blockdump.log" 2>/dev/null | agg_path | head -30
 	echo "== rq aggregated (dev rwbs issuer) =="
-	grep block_rq_issue "$d/trace.log" 2>/dev/null | rq_agg | head -20
+	cat "$d/block.log" 2>/dev/null | rq_agg | head -20
 	echo "== rq non-sg_raw/hdparm (first 40) =="
-	grep block_rq_issue "$d/trace.log" 2>/dev/null | grep -vE '\[(sg_raw|hdparm)\]' | head -40 || true
-	echo "== exec'd storage tools (full graph stays in trace.log for recwho) =="
-	grep sched_process_exec "$d/trace.log" 2>/dev/null \
+	grep -vE '\[(sg_raw[^]]*|hdparm)\]' "$d/block.log" 2>/dev/null | head -40 || true
+	echo "== exec'd storage tools (full graph stays in fork.log.gz for recwho) =="
+	zcat -q "$d/fork.log.gz" 2>/dev/null | grep sched_process_exec \
 	| sed -E 's/.*filename=([^ ]+).*/\1/' \
 	| grep -E 'sg_raw|cryptsetup|hdparm|smartctl|synospace|synofstool|synostgd|dmsetup|mdadm|btrfs' \
 	| sort | uniq -c | sort -rn | head -20 ;;
+
+recwakes) # hibdbg recwakes DIR: one block per wake episode — duration, sata
+	# I/O totals, and block_dump attribution from the first 15 min (the
+	# waker; later activity piggybacks on an already-spinning drive).
+	# All timing rides the 30s state.log sample grid: no date arithmetic.
+	d=${2:?usage: hibdbg recwakes DIR}
+	# state.log -> "W|S <ts>" per sample, in order
+	awk '
+	function emit() { print (act ? "W " : "S ") t }
+	/^== /{ if (t != "") emit(); t=$2" "$3; act=0; next }
+	/^\/dev\//{ if ($NF != "standby" && $NF != "sleeping") act=1 }
+	END{ if (t != "") emit() }' "$d/state.log" > /tmp/hibstate.$$
+	# episodes: wake-ts, sleep-ts (or last sample), 15min-cutoff ts, samples
+	awk 'BEGIN{n=0}
+	{ s=$1; ts=$2" "$3
+	  if (s == "W") {
+		if (n == 0) { w=ts; cut=ts; n=1 } else { n++; if (n <= 30) cut=ts }
+	  } else if (n > 0) { print w "|" ts "|" cut "|" n; n=0 }
+	}
+	END{ if (n > 0) print w "|" ts "|" cut "|" n "|awake-at-end" }' \
+		/tmp/hibstate.$$ > /tmp/hibep.$$
+	rm -f /tmp/hibstate.$$
+	[ -s /tmp/hibep.$$ ] || { echo "no wake episodes in $d"; rm -f /tmp/hibep.$$; exit 0; }
+	while IFS='|' read -r w s cut n tail; do
+		io=$(awk -v a="$w" -v b="$s" '
+			/^== /{ts=$2" "$3; next}
+			$3 ~ /^sata[0-9]+$/ { k=$3
+				if (k in pw && ts >= a && ts <= b) { r+=$4-pr[k]; w+=$8-pw[k] }
+				pr[k]=$4; pw[k]=$8 }
+			END{ printf "r+%d w+%d", r, w }' "$d/diskstats.log")
+		echo "== wake $w -> $s  ($(( n / 2 ))m)  $io ${tail:+[$tail]}"
+		awk -v a="$w" -v b="$cut" '
+			/^== /{ts=$2" "$3; next}
+			ts >= a && ts <= b' "$d/blockdump.log" 2>/dev/null > /tmp/hibwk.$$
+		if [ -s /tmp/hibwk.$$ ]; then
+			echo "  procs (first 15m):"; agg_proc < /tmp/hibwk.$$ | head -5 | sed 's/^/    /'
+			echo "  paths (first 15m):"; agg_path < /tmp/hibwk.$$ | head -5 | sed 's/^/    /'
+		else
+			echo "  (no block_dump events in first 15m; check rq/diskstats)"
+		fi
+		rm -f /tmp/hibwk.$$
+	done < /tmp/hibep.$$
+	rm -f /tmp/hibep.$$ ;;
 
 sysmig)	# hibdbg sysmig: migrate DSM system arrays (md0=/, md1=swap) off the
 	# HDDs onto the NVMe system partitions. Idempotent: one safe step per
@@ -791,6 +855,21 @@ sleepnow) # hibdbg sleepnow [sec]: force standby, record full wake timeline
 	systemctl start syslog-ng
 	trap - EXIT ;;
 
+rootspace)
+	echo "== md0 =="
+	df -h /
+	echo; echo "== top-level dirs (md0 only) =="
+	du -xhd1 / 2>/dev/null | sort -rh | head -15
+	echo; echo "== files >50M on md0 =="
+	find / -xdev -type f -size +50M 2>/dev/null | xargs -r du -h | sort -rh | head -20
+	echo; echo "== /var/log by size =="
+	du -sh /var/log/* 2>/dev/null | sort -rh | head -15
+	echo; echo "== recordings on md0 =="
+	du -sh /root/hibdbg.rec.* 2>/dev/null || echo "(none)"
+	echo; echo "== leftover instrument state =="
+	echo "block_dump=$(cat /proc/sys/vm/block_dump)"
+	pgrep -af 'hibdbg.*_rec|cat.*trace_pipe' || echo "no stray recorder processes" ;;
+
 *)	cat <<USAGE
 usage: hibdbg <cmd>
  discovery
@@ -834,14 +913,16 @@ usage: hibdbg <cmd>
   fresh [min] [path]  files modified in last MIN min (def 10, /volume3)
  long recording
   rec [sec]           background all-instrument recorder (def 4h), survives
-                      logout; writes /root/hibdbg.rec.<ts>/
+                      logout; writes <scriptdir>/hibdbg.rec.<ts>/
   recstop             stop the latest recording
   recsum DIR          summarize a recording (episodes, states, attribution)
+  recwakes DIR        per-wake table: duration, I/O, what woke it
   recwho DIR COMM     parent chains for COMM execs in a recording
  one-shot
   sleepnow [sec] [nopoll]  force standby, report wakes; nopoll stops scemd
                       (SCT temp polls off, fans hold speed) for the window
   probe               live + state + md0 trace + lcc delta, with verdict key
+  rootspace           md0 space breakdown (what filled the system partition)
   lcc [sec]           SMART load-cycle counters; with SEC show delta (non-waking)
   disks               model/serial/firmware per drive (non-waking)
 USAGE

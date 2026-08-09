@@ -96,8 +96,26 @@ so runs are reproducible and no ad-hoc command pollutes a measurement:
   that /proc sampling can never catch.
 - SMART `-n standby` + `hdparm -C` (`state`, `lcc`) — power state and
   wear counters that never wake a sleeping drive.
-- A detached long recorder (`rec`/`recsum`/`recwho`) — all of the above for
-  hours, surviving ssh logout, summarized into an episode timeline.
+- A detached long recorder (`rec`/`recsum`/`recwho`/`recwakes`) — all of the
+  above for hours, surviving ssh logout, summarized into an episode timeline.
+
+Recorder practicalities, learned the hard way over a 24h run:
+
+- Recordings must not land on `/` (md0 is 8 GB; a 4h run left a 6.4 GB
+  `trace.log` and filled it, after which every package update fails with
+  "free space of system partition is insufficient"). They now go next to the
+  script — keep that on an SSD volume, never on the drives under test.
+  `rootspace` breaks down what is eating md0.
+- The fork/exec stream is the bulk of the data and is gzipped
+  (`fork.log.gz`, ~3 GB/day); queue events stay uncompressed in `block.log`
+  so attribution greps are instant. `recwho` streams the compressed graph.
+- Only the **first ~15 minutes** after a wake identify the waker. Everything
+  later is other work piggybacking on an already-spinning drive — the single
+  most misleading thing in a raw timeline. `recwakes DIR` cuts exactly there
+  and prints one block per episode: wake → sleep, duration, sata I/O totals,
+  and the top processes and dirtied paths from that opening window.
+- Run one block_dump-family and one tracepoint-family instrument at a time;
+  concurrent recorders starve each other's traces.
 
 ## What was keeping the box awake (discovery order)
 
@@ -122,6 +140,19 @@ Per-setup checklist, not a verdict for yours:
 10. **Sonarr** rescan/analyse walking the media library with `ffprobe`
     (thousands of reads per pass) — "Analyse video files" off, "Rescan after
     refresh" never; same treatment as Radarr/Lidarr.
+
+11. **Scheduled DSM maintenance, scattered across the day** — a 24h
+    recording showed 7 wakes, and none of them was the hourly cycle it
+    sounded like: snapshot, retention and reclaim jobs
+    (`synosharesnapsh`, `synoretainer`, `synostgreclaim`, `snaptree.bin`,
+    `btrfs_deleted_subvol.info`) firing at ~8 unrelated times. What you
+    hear as "hourly" is the idle timer's post-wake spin window, not the
+    trigger. Consolidating those schedules into one or two slots — ideally
+    adjacent to the replication window you already accept — collapses
+    several wakes into one.
+12. **Container backups written to the HDD volume** — an Immich database
+    dump (`immich-db-backup-*.sql.gz.tmp`) at 02:00 nightly; retargeting
+    the backup path to the SSD volume removes that wake outright.
 
 Accepted periodic wakes: snapshot replication (3h), real client access,
 btrfs `auto_reclaim_space` housekeeping episodes (Synology-internal, no
@@ -212,9 +243,10 @@ show the failed-system-partition warning.
 - `sleepnow [sec]` — forced-standby window with 5s-grain diskstats
   timeline, block_dump attribution, and a queue-level trace that includes
   passthrough; the acceptance test for the whole stack.
-- `rec [sec]` / `recsum DIR` / `recwho DIR COMM` — hours-long detached
-  recording; episode timeline, state transitions, attribution, and
-  parent chains for short-lived helpers.
+- `rec [sec]` / `recsum DIR` / `recwakes DIR` / `recwho DIR COMM` —
+  hours-long detached recording; episode timeline, per-wake attribution
+  table, and parent chains for short-lived helpers. A 24h run is the only
+  way to separate scheduled wakes from your own access.
 - `state` / `lcc` — non-waking power state and SMART wear counters.
   The 24h `Start_Stop_Count` delta is the wear ledger: budgets are ~50k
   start/stop and 600k load/unload cycles; ~10–16 wakes/day ≈ 5k/year —
@@ -228,8 +260,9 @@ show the failed-system-partition warning.
     ground truth   live [s], rq [s], state, lcc [s], disks
     attribution    who [pat] [s], md0/md0files [s], pollwho [s] [comm],
                    fresh [min] [path], logs [s], hdd/sys/raw/tree/files/when
-    long recording rec [s], recstop, recsum DIR, recwho DIR COMM
-    one-shot       sleepnow [s] [nopoll], probe
+    long recording rec [s], recstop, recsum DIR, recwakes DIR,
+                   recwho DIR COMM
+    one-shot       sleepnow [s] [nopoll], probe, rootspace
     mitigation     quiesce/unquiesce, sysmig, pollshim on|off|status,
                    sleepd start|stop|status [min], boot,
                    hib [min|undo], hibdebug on|off, calm/uncalm, calm3/uncalm3

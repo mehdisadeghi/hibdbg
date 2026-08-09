@@ -11,7 +11,8 @@ DEF_MIN=60
 RECBASE=$(dirname "$(readlink -f "$0")")
 
 die() { echo "$*" >&2; exit 1; }
-[ "$(id -u)" = 0 ] || die "run as root"
+
+[ "$(id -u)" = 0 ] || echo "note: not root; privileged steps fail if unpermitted" >&2
 
 denoise() { grep -vE 'ppid:[0-9]+\(syno_hibernatio' || true; }
 

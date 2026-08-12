@@ -40,4 +40,5 @@ Task Scheduler boot-up task (root) running `hibdbg.sh boot`.
 
 - `GUIDE.md`  — full field guide: method, culprits, fixes, verification, undo
 - `SYSMIG.md` — system-partition migration record and undo
+- `ADR.md`    — architecture decisions
 - `HANDOFF.md` — historical hunt notes

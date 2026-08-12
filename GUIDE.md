@@ -220,11 +220,17 @@ You can't kill the poller (it drives the fans). You can make it harmless:
 ## Fix 4: `sleepd` — DIY standby daemon
 
 hd-idle semantics: a detached loop checks sata diskstats once a minute and
-issues `hdparm -y` after N idle minutes (default: the `standbytimer` value).
+issues `hdparm -y` after `standbytimer` idle minutes, re-read every cycle so
+the DSM setting is the single source of truth (`0` = off, stops nothing).
 It refuses to start — and exits mid-flight — if the shim is not installed,
 because standby without the shim produces a wake/sleep churn loop that eats
 the start/stop budget. All its probes are non-waking and invisible to
 diskstats, so it never resets its own idle measurement.
+
+Issuing standby resets that drive's idle clock, which is not cosmetic:
+passthrough wakes move no diskstats counter, so an expired clock would
+otherwise re-stop the drive on the next cycle, seconds after each spin-up —
+the same churn the shim requirement exists to prevent. See `ADR.md`.
 
 ## Boot task: the whole stack self-heals
 
@@ -264,7 +270,7 @@ show the failed-system-partition warning.
                    recwho DIR COMM
     one-shot       sleepnow [s] [nopoll], probe, rootspace
     mitigation     quiesce/unquiesce, sysmig, pollshim on|off|status,
-                   sleepd start|stop|status [min], boot,
+                   sleepd start|stop|status, boot,
                    hib [min|undo], hibdebug on|off, calm/uncalm, calm3/uncalm3
     smb / nfs / hiblog
 

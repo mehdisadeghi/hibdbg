@@ -148,7 +148,7 @@ usage: hibdbg <cmd> [args]        hibdbg <cmd> --help for detail
   hibdebug on|off     DSM hibernation debug logging (safe post-sysmig)
   sysmig              migrate md0/md1 system arrays HDD -> NVMe (re-run until done)
   pollshim on|off|status  cache scemd SCT polls while drives sleep (no wake)
-  sleepd start|stop|status [min]  DIY standby daemon (needs pollshim)
+  sleepd start|stop|status  DIY standby daemon (needs pollshim)
   boot                idempotent boot task: pollshim on + sysmig + sleepd start
   calm [sec]          batch md0 journal+writeback (def 600s); print persist hint
   uncalm              restore defaults
@@ -274,13 +274,18 @@ syslog-ng is paused for the window. Do not run other hibdbg commands meanwhile.
 EOF
 	;;
 	sleepd) cat <<'EOF'
-usage: hibdbg sleepd start|stop|status [min]
+usage: hibdbg sleepd start|stop|status
 
 DIY standby daemon with hd-idle semantics: watches /proc/diskstats and issues
-hdparm -y per drive after MIN idle minutes. Without MIN it tracks synoinfo's
-standbytimer live, re-reading it every cycle, so hib MIN takes effect without a
-restart. DSM's own idle timer never fires on this box (NVMe pool activity
-vetoes it), which is why this exists.
+hdparm -y per drive after standbytimer idle minutes. The timer is DSM's own
+setting, re-read every cycle, so hib MIN or the DSM UI takes effect without a
+restart; standbytimer=0 is DSM's "hibernation off" and stops nothing. DSM's own
+idle timer never fires on this box (NVMe pool activity vetoes it), which is why
+this exists.
+
+Issuing standby resets the idle clock for that drive. Passthrough wakes move no
+diskstats counter, so without that reset an expired clock re-stops the drive
+seconds after every spin-up.
 
 Refuses to start, and exits if the shim disappears, unless pollshim is
 installed: scemd's polls would wake the drives right back and the pair would
@@ -953,9 +958,9 @@ pollshim) # hibdbg pollshim on|off|status: wrap /usr/syno/bin/sg_raw so scemd's
 	*)	die "usage: hibdbg pollshim on|off|status" ;;
 	esac ;;
 
-sleepd)	# hibdbg sleepd start|stop|status [min]: DIY standby daemon (hd-idle
-	# semantics). Issues hdparm -y per drive after MIN idle minutes
-	# (default: synoinfo standbytimer). Requires pollshim, else scemd's
+sleepd)	# hibdbg sleepd start|stop|status: DIY standby daemon (hd-idle
+	# semantics). Issues hdparm -y per drive after standbytimer idle
+	# minutes, re-read every cycle. Requires pollshim, else scemd's
 	# polls wake the drives right back (proven) and the pair would churn.
 	case "${2:-}" in
 	start)
@@ -964,39 +969,38 @@ sleepd)	# hibdbg sleepd start|stop|status [min]: DIY standby daemon (hd-idle
 		if pgrep -f 'hibdbg.sh _sleepd' >/dev/null; then
 			echo "already running"; exit 0
 		fi
-		[ -z "${3:-}" ] || num "$3" "sleepd start [min]"
-		setsid "$0" _sleepd "${3:-}" >/dev/null 2>&1 < /dev/null &
-		if [ -n "${3:-}" ]; then
-			echo "sleepd started (idle ${3}m fixed -> standby)"
-		else
-			echo "sleepd started (tracks standbytimer live -> standby)"
-		fi
+		setsid "$0" _sleepd >/dev/null 2>&1 < /dev/null &
+		cur=$(synogetkeyvalue /etc/synoinfo.conf standbytimer 2>/dev/null)
+		echo "sleepd started (standbytimer ${cur:-0}m -> standby; 0 = off)"
 		echo "persist: Task Scheduler > Triggered > Boot-up > root:"
 		echo "  $(readlink -f "$0") sleepd start" ;;
 	stop)	pkill -f 'hibdbg.sh _sleepd' && echo "stopped" || echo "not running" ;;
 	status)	pgrep -f 'hibdbg.sh _sleepd' >/dev/null && echo "running" || echo "not running"
 		"$0" state ;;
-	*)	die "usage: hibdbg sleepd start|stop|status [min]" ;;
+	*)	die "usage: hibdbg sleepd start|stop|status" ;;
 	esac ;;
 
-_sleepd) fixed=${2:-}
-	declare -A last prev
+_sleepd) declare -A last prev
 	while :; do
 		# shim gone (boot/update restored stock sg_raw): polls wake drives
 		# again -> issuing standby would churn cycles; die, audit shows it
 		grep -q pollshim /usr/syno/bin/sg_raw 2>/dev/null || exit 0
-		min=$fixed
-		[ -n "$min" ] || min=$(synogetkeyvalue /etc/synoinfo.conf standbytimer 2>/dev/null)
-		[ -n "$min" ] || min=10
+		min=$(synogetkeyvalue /etc/synoinfo.conf standbytimer 2>/dev/null)
 		now=$(date +%s)
 		while read -r name r w; do
 			cur="$r $w"
 			if [ "${prev[$name]:-}" != "$cur" ]; then
 				last[$name]=$now; prev[$name]=$cur; continue
 			fi
+			# 0 or unset is DSM's "hibernation off"; keep tracking idle, stop nothing
+			[ "${min:-0}" -gt 0 ] || continue
 			if [ $(( now - ${last[$name]:-$now} )) -ge $(( min * 60 )) ]; then
 				if hdparm -C "/dev/$name" 2>/dev/null | grep -q 'active'; then
 					hdparm -y "/dev/$name" >/dev/null 2>&1 || true
+					# a wake carried by passthrough moves no diskstats counter,
+					# so without this the clock stays expired and every cycle
+					# re-stops the drive seconds after it spins up
+					last[$name]=$now
 				fi
 			fi
 		done < <(grep -E ' sata[0-9]+ ' /proc/diskstats | awk '{print $3, $4, $8}')

@@ -233,12 +233,17 @@ EOF
 usage: hibdbg recwho DIR COMM
 
 Parent chains for every exec of COMM in a recording: grandparent -> parent ->
-COMM, aggregated by frequency. Names the daemon behind millisecond-lived
-helpers (sg_raw, cryptsetup, ffprobe) that /proc sampling can never catch.
+COMM, by name, with the exec count and how many distinct parent pids produced
+them. One long-lived daemon and ten thousand short-lived shells both collapse
+to one row, and the pids column tells them apart. Names the daemon behind
+millisecond-lived helpers (sg_raw, cryptsetup, ffprobe) that /proc sampling
+can never catch.
 
 Streams the compressed fork graph once, building the fork map in memory, so a
 comm that execs tens of thousands of times costs the same as one that execs
-twice. No root.
+twice. Each exec is resolved against the map as it stood at that moment: a
+day-long recording cycles through the pid space repeatedly, and resolving
+afterwards blames whoever last held the number. No root.
 
 A grandparent shown as ? forked before the recording started; its pid is not
 looked up in /proc, which after a long recording may have handed that number to
@@ -791,21 +796,23 @@ recwho)	# hibdbg recwho DIR COMM: parent chains for COMM execs in a recording.
 		next
 	}
 	/sched_process_exec/ {
-		if (index($0, c) && match($0, / pid=[0-9]+/))
-			ex[substr($0, RSTART + 5, RLENGTH - 5)]++
+		if (!index($0, c) || !match($0, / pid=[0-9]+/)) next
+		p = substr($0, RSTART + 5, RLENGTH - 5)
+		# resolve here, not at EOF: a day-long recording cycles through the
+		# pid space many times, so the map must be read as it stood when
+		# this exec happened
+		pn = (p in pcomm) ? pcomm[p] : "?"
+		pp = (p in ppid)  ? ppid[p]  : "?"
+		# ? = forked before the recording; /proc cannot be trusted to still
+		# hold that pid afterwards, so it is left unnamed rather than guessed
+		gn = (pp in pcomm) ? pcomm[pp] : "?"
+		k = gn " -> " pn " -> " c
+		n[k]++
+		if (!seen[k SUBSEP pp]++) np[k]++
 	}
-	END {
-		for (p in ex) {
-			pn = (p in pcomm) ? pcomm[p] : "?"
-			pp = (p in ppid)  ? ppid[p]  : "?"
-			# no fork line means the parent predates the recording; /proc
-			# cannot be trusted to still hold that pid, so leave it unnamed
-			gn = (pp in pcomm) ? pcomm[pp] "(" ppid[pp] ")" : "?"
-			n[gn " -> " pn "(" pp ") -> " c] += ex[p]
-		}
-		for (k in n) printf "%7d %s\n", n[k], k
-	}' | sort -rn)
+	END { for (k in n) printf "%8d %6d  %s\n", n[k], np[k], k }' | sort -rn)
 	[ -n "$out" ] || die "no $c exec in $d"
+	printf '%8s %6s  %s\n' execs pids chain
 	echo "$out" ;;
 
 recstop) d=$(ls -dt "$RECBASE"/hibdbg.rec.*/ 2>/dev/null | head -1)

@@ -227,6 +227,11 @@ because standby without the shim produces a wake/sleep churn loop that eats
 the start/stop budget. All its probes are non-waking and invisible to
 diskstats, so it never resets its own idle measurement.
 
+Every standby it issues is appended to `sleepd.log` beside the script with the
+idle minutes behind it, and `sleepd status` shows the last five. Two separate
+investigations stalled on not being able to tell "never issued standby" from
+"issued it and the drive was woken again inside the 30s sampling grid".
+
 Issuing standby resets that drive's idle clock, which is not cosmetic:
 passthrough wakes move no diskstats counter, so an expired clock would
 otherwise re-stop the drive on the next cycle, seconds after each spin-up —

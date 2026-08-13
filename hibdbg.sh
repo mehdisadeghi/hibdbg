@@ -9,6 +9,7 @@ LOG=/var/log/hibernationFull.log
 DEF_MIN=60
 # recordings must not land on md0 (8G, fills up); home sits on a volume
 RECBASE=$(dirname "$(readlink -f "$0")")
+SLEEPLOG=$RECBASE/sleepd.log
 
 die() { echo "$*" >&2; exit 1; }
 
@@ -235,8 +236,13 @@ Parent chains for every exec of COMM in a recording: grandparent -> parent ->
 COMM, aggregated by frequency. Names the daemon behind millisecond-lived
 helpers (sg_raw, cryptsetup, ffprobe) that /proc sampling can never catch.
 
-Streams the compressed fork graph in three passes (exec pids, their forks,
-grandparents), so a day-long recording takes minutes, not hours. No root.
+Streams the compressed fork graph once, building the fork map in memory, so a
+comm that execs tens of thousands of times costs the same as one that execs
+twice. No root.
+
+A grandparent shown as ? forked before the recording started; its pid is not
+looked up in /proc, which after a long recording may have handed that number to
+an unrelated process.
 EOF
 	;;
 	recstop) cat <<'EOF'
@@ -286,6 +292,11 @@ this exists.
 Issuing standby resets the idle clock for that drive. Passthrough wakes move no
 diskstats counter, so without that reset an expired clock re-stops the drive
 seconds after every spin-up.
+
+Every standby issued is appended to sleepd.log next to the script, with the
+idle minutes that triggered it; status shows the last five. Without it, "never
+issued standby" and "issued it and the drive came straight back" are
+indistinguishable from outside.
 
 Refuses to start, and exits if the shim disappears, unless pollshim is
 installed: scemd's polls would wake the drives right back and the pair would
@@ -765,21 +776,37 @@ _rec)	dur=$2; d=$3
 	done ;;
 
 recwho)	# hibdbg recwho DIR COMM: parent chains for COMM execs in a recording.
-	# fork.log.gz is too big to grep per-pid; extract the COMM-relevant
-	# slice in 3 streaming passes, then run forkchain on the extract.
+	# one pass: fork edges into a map, then resolve each COMM exec two
+	# levels up. a pid alternation would exceed the 128K argument cap and
+	# per-pid greps would rescan the graph thousands of times.
 	d=${2:?usage: hibdbg recwho DIR COMM}; c=${3:?comm}
-	ex=$(zcat -q "$d/fork.log.gz" | grep sched_process_exec | grep "$c" || true)
-	[ -n "$ex" ] || die "no $c exec in $d"
-	pat=$(echo "$ex" | sed -E 's/.* pid=([0-9]+).*/\1/' | sort -u | paste -sd'|' -)
-	pf=$(zcat -q "$d/fork.log.gz" \
-		| grep -E "sched_process_fork.*child_pid=($pat)( |\$)" || true)
-	gpat=$(echo "$pf" | sed -E 's/.*comm=[^ ]+ pid=([0-9]+).*/\1/' | sort -u | paste -sd'|' -)
-	gf=$([ -n "$gpat" ] && zcat -q "$d/fork.log.gz" \
-		| grep -E "sched_process_fork.*child_pid=($gpat)( |\$)" || true)
-	tmp=$(mktemp)
-	printf '%s\n%s\n%s\n' "$ex" "$pf" "$gf" > "$tmp"
-	forkchain "$tmp" "$c"
-	rm -f "$tmp" ;;
+	out=$(zcat -q "$d/fork.log.gz" | awk -v c="$c" '
+	/sched_process_fork/ {
+		if (!match($0, /comm=[^ ]+ pid=[0-9]+/)) next
+		split(substr($0, RSTART, RLENGTH), a, /[= ]/)
+		if (match($0, /child_pid=[0-9]+/)) {
+			ch = substr($0, RSTART + 10, RLENGTH - 10)
+			pcomm[ch] = a[2]; ppid[ch] = a[4]
+		}
+		next
+	}
+	/sched_process_exec/ {
+		if (index($0, c) && match($0, / pid=[0-9]+/))
+			ex[substr($0, RSTART + 5, RLENGTH - 5)]++
+	}
+	END {
+		for (p in ex) {
+			pn = (p in pcomm) ? pcomm[p] : "?"
+			pp = (p in ppid)  ? ppid[p]  : "?"
+			# no fork line means the parent predates the recording; /proc
+			# cannot be trusted to still hold that pid, so leave it unnamed
+			gn = (pp in pcomm) ? pcomm[pp] "(" ppid[pp] ")" : "?"
+			n[gn " -> " pn "(" pp ") -> " c] += ex[p]
+		}
+		for (k in n) printf "%7d %s\n", n[k], k
+	}' | sort -rn)
+	[ -n "$out" ] || die "no $c exec in $d"
+	echo "$out" ;;
 
 recstop) d=$(ls -dt "$RECBASE"/hibdbg.rec.*/ 2>/dev/null | head -1)
 	[ -n "$d" ] || die "no recordings under $RECBASE"
@@ -976,7 +1003,9 @@ sleepd)	# hibdbg sleepd start|stop|status: DIY standby daemon (hd-idle
 		echo "  $(readlink -f "$0") sleepd start" ;;
 	stop)	pkill -f 'hibdbg.sh _sleepd' && echo "stopped" || echo "not running" ;;
 	status)	pgrep -f 'hibdbg.sh _sleepd' >/dev/null && echo "running" || echo "not running"
-		"$0" state ;;
+		"$0" state
+		echo "-- standby issued (last 5 of $SLEEPLOG):"
+		tail -5 "$SLEEPLOG" 2>/dev/null || echo "  (none yet)" ;;
 	*)	die "usage: hibdbg sleepd start|stop|status" ;;
 	esac ;;
 
@@ -997,6 +1026,8 @@ _sleepd) declare -A last prev
 			if [ $(( now - ${last[$name]:-$now} )) -ge $(( min * 60 )) ]; then
 				if hdparm -C "/dev/$name" 2>/dev/null | grep -q 'active'; then
 					hdparm -y "/dev/$name" >/dev/null 2>&1 || true
+					printf '%s %s standby after %dm idle\n' "$(date '+%F %T')" \
+						"$name" $(( (now - ${last[$name]:-$now}) / 60 )) >> "$SLEEPLOG"
 					# a wake carried by passthrough moves no diskstats counter,
 					# so without this the clock stays expired and every cycle
 					# re-stops the drive seconds after it spins up

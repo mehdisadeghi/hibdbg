@@ -48,6 +48,9 @@ no ad-hoc command requests.
    standby and self-wake -> sleepnow settles: sync; sleep 35; sync (outlasts
    ext4 5s + btrfs 30s commits) before hdparm -y.
 5. smartctl with -n standby never wakes; hdparm -C never wakes.
+   (CORRECTED 2026-09-01: false for smartctl through SAT — it issues ATA
+   IDENTIFY before the power check and wakes the drive, queue-trace proven;
+   lcc/disks now gate on hdparm -C, which remains safe.)
 
 ## Current state (last measurements)
 - Idle md0: ~4 writes/min (was 124 with debug mode on). Data volume: 0.
@@ -81,6 +84,8 @@ If attribution empty despite diskstats deltas: below-page-cache class
   and `quiesce` after every update.
 
 ## The tool: hibdbg (bash, single file, subcommands)
+(Historical: commands were since regrouped under 9 verbs — see GUIDE.md
+"Script reference" or `hibdbg --help` for current names.)
 Lives on the NAS (user runs `sudo ./hibdbg.sh <cmd>`). Trusted trio is
 tracer-free: live / logs / state (+lcc). Commands:
 map, audit, sched, on/off (off warns if syno_hibernatio active),

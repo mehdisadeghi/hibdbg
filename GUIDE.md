@@ -91,13 +91,16 @@ so runs are reproducible and no ad-hoc command pollutes a measurement:
   `sleepnow`) — process + dirtied-file attribution, feedback-free.
 - `block:block_rq_issue` tracepoint (`rq`) — every request on the drive
   queues including passthrough, with issuer and CDB bytes.
-- `sched_process_fork/exec` tracepoints (`pollwho`, `recwho`) — naming
+- `sched_process_fork/exec` tracepoints (`who forks`, `rec who`) — naming
   daemons that spawn millisecond-lived helpers (`sg_raw`, `cryptsetup`)
   that /proc sampling can never catch.
-- SMART `-n standby` + `hdparm -C` (`state`, `lcc`) — power state and
-  wear counters that never wake a sleeping drive.
-- A detached long recorder (`rec`/`recsum`/`recwho`/`recwakes`) — all of the
-  above for hours, surviving ssh logout, summarized into an episode timeline.
+- `hdparm -C` (`status state`) — power state, genuinely non-waking. smartctl
+  is NOT, even with `-n standby`: it identifies the device (ATA IDENTIFY via
+  SAT) *before* honoring the flag and wakes a sleeping drive — queue-trace
+  proven. `status lcc`/`status disks` therefore skip drives in standby.
+- A detached long recorder (`rec`, analyzed with `rec sum`/`rec who`/
+  `rec wakes`) — all of the above for hours, surviving ssh logout,
+  summarized into an episode timeline.
 
 Recorder practicalities, learned the hard way over a 24h run:
 
@@ -105,13 +108,12 @@ Recorder practicalities, learned the hard way over a 24h run:
   `trace.log` and filled it, after which every package update fails with
   "free space of system partition is insufficient"). They now go next to the
   script — keep that on an SSD volume, never on the drives under test.
-  `rootspace` breaks down what is eating md0.
 - The fork/exec stream is the bulk of the data and is gzipped
   (`fork.log.gz`, ~3 GB/day); queue events stay uncompressed in `block.log`
-  so attribution greps are instant. `recwho` streams the compressed graph.
+  so attribution greps are instant. `rec who` streams the compressed graph.
 - Only the **first ~15 minutes** after a wake identify the waker. Everything
   later is other work piggybacking on an already-spinning drive — the single
-  most misleading thing in a raw timeline. `recwakes DIR` cuts exactly there
+  most misleading thing in a raw timeline. `rec wakes DIR` cuts exactly there
   and prints one block per episode: wake → sleep, duration, sata I/O totals,
   and the top processes and dirtied paths from that opening window.
 - Run one block_dump-family and one tracepoint-family instrument at a time;
@@ -123,7 +125,7 @@ Per-setup checklist, not a verdict for yours:
 
 1. **AFP** (`afpd`/`cnid_dbd`) serving a Mac — top writer. Disabled; SMB.
 2. **Universal Search / SynoFinder indexing** — stopped, disabled, stale
-   queues purged (`quiesce`).
+   queues purged (`fix quiesce`).
 3. **Orphaned Synology Drive queues** from a removed package.
 4. **Download clients' state on the HDD volume** — nzbget queue/temp moved
    to SSD; later round: its **RSS feed files** (`feed-*.tmp`, `feeds.new`,
@@ -135,7 +137,7 @@ Per-setup checklist, not a verdict for yours:
 9. **An external API poller**: something queried `SYNO.Core.Storage` every
    15 minutes (here: a Home-Assistant-class integration); each query spawns
    `cryptsetup` to re-read the LUKS headers from disk. Found via fork-trace
-   (`recwho ... cryptsetup` → `SYNO.Storage.CGI`). Fixed client-side by
+   (`rec who ... cryptsetup` → `SYNO.Storage.CGI`). Fixed client-side by
    disabling/retiming the storage sensors.
 10. **Sonarr** rescan/analyse walking the media library with `ffprobe`
     (thousands of reads per pass) — "Analyse video files" off, "Rescan after
@@ -153,19 +155,27 @@ Per-setup checklist, not a verdict for yours:
 12. **Container backups written to the HDD volume** — an Immich database
     dump (`immich-db-backup-*.sql.gz.tmp`) at 02:00 nightly; retargeting
     the backup path to the SSD volume removes that wake outright.
+13. **The instruments themselves** — `smartctl` wakes a sleeping drive even
+    with `-n standby`: it issues ATA IDENTIFY through the SAT layer before
+    the power check. Both wake storms in the decisive recording were the
+    tool's own `lcc` runs. Each such passthrough wake triggers a kernel
+    requeue storm — millions of block-layer retries during the spin-up
+    window (830 MB of queue trace in minutes), audible as a "machine-gun"
+    burst right after the spin-up sound. Fixed by gating every smartctl
+    behind `hdparm -C` and skipping drives in standby.
 
 Accepted periodic wakes: snapshot replication (3h), real client access,
 btrfs `auto_reclaim_space` housekeeping episodes (Synology-internal, no
-exposed tuning knob worth touching; `commit=` batching exists via `calm3`
+exposed tuning knob worth touching; `commit=` batching exists via `fix calm3`
 but batching cannot produce standby, only fewer bursts).
 
-## Fix 1: move the DSM system partition off the HDDs (`sysmig`)
+## Fix 1: move the DSM system partition off the HDDs (`fix sysmig`)
 
 The rq view showed every residual `md0` write arriving at the HDDs as
 write+flush barriers. If your NVMe drives are a DSM storage pool, DSM already
 created exactly-sized unused system partitions on them. The migration is
-mdadm RAID1 member management, automated idempotently by `sysmig` (one safe
-step per run, refuses while resyncing, re-run until done):
+mdadm RAID1 member management, automated idempotently by `fix sysmig` (one
+safe step per run, refuses while resyncing, re-run until done):
 
 add NVMe p1/p2 to md0/md1 → wait `[UUUU]` → fail+remove sata members →
 `--grow --raid-devices=2`.
@@ -195,7 +205,7 @@ storage idle; an NVMe pool running Docker never qualifies; the debug
 tooling doesn't trace NVMe, so the veto is invisible. Stop fighting this
 layer; bypass it.
 
-## Fix 3: `pollshim` — cache the temperature polls
+## Fix 3: `fix shim` — cache the temperature polls
 
 The A/B that settled it: `sleepnow 60` (forced standby, scemd running) —
 drives back awake in seconds; `sleepnow 60 nopoll` (scemd stopped for the
@@ -205,7 +215,7 @@ by scemd (proven with fork-tracing), and it spins up a standby drive.
 
 You can't kill the poller (it drives the fans). You can make it harmless:
 
-- `pollshim on` moves `/usr/syno/bin/sg_raw` to `sg_raw.real` and installs
+- `fix shim on` moves `/usr/syno/bin/sg_raw` to `sg_raw.real` and installs
   a wrapper: non-sata targets and non-READ-LOG CDBs pass through untouched;
   for the poll CDB it checks drive power state first (`hdparm -C` CHECK
   POWER MODE — verified non-waking) and serves a cached copy of the last
@@ -214,7 +224,7 @@ You can't kill the poller (it drives the fans). You can make it harmless:
 - Acceptance trace reads like a proof: passthrough entries while awake,
   the two standby commands, then 150s of cache hits and an end state of
   `standby` on both drives.
-- DSM restores the stock binary at every boot; `pollshim on` is idempotent
+- DSM restores the stock binary at every boot; `fix shim on` is idempotent
   and boot-safe (detects and discards the stale `.real`).
 
 ## Fix 4: `sleepd` — DIY standby daemon
@@ -228,7 +238,7 @@ the start/stop budget. All its probes are non-waking and invisible to
 diskstats, so it never resets its own idle measurement.
 
 Every standby it issues is appended to `sleepd.log` beside the script with the
-idle minutes behind it, and `sleepd status` shows the last five. Two separate
+idle minutes behind it, and `fix sleepd status` shows the last five. Two separate
 investigations stalled on not being able to tell "never issued standby" from
 "issued it and the drive was woken again inside the 30s sampling grid".
 
@@ -237,6 +247,25 @@ passthrough wakes move no diskstats counter, so an expired clock would
 otherwise re-stop the drive on the next cycle, seconds after each spin-up —
 the same churn the shim requirement exists to prevent. See `ADR.md`.
 
+## Fix 5: `watch` — know about every wake, by name
+
+Once the box mostly sleeps, the remaining wakes happen when nobody is
+listening. `watch` is a permanent daemon that keeps a *private ftrace
+instance* armed on the sata queues — a RAM ring buffer, zero disk I/O,
+separate enable/filter so `rec` and `who` still work — and samples drive
+state once a minute with the non-waking `hdparm -C`. Any queue command that
+arrives while a drive was in standby (excluding the stack's own probes) is
+an episode: wallclock, drive states, and the first commands with their
+issuing process land in `watch.log`, passthrough included.
+
+Notification reuses Synology's own mail rather than duplicating SMTP
+credentials: DSM 7 exposes no CLI to its configured mailer (ssmtp.conf
+ships empty), but Task Scheduler mails a task's output. A daily root task
+running `watch digest` + "Send run details by email" is the digest channel
+(default). `watch mode perwake` additionally pushes a DSM notification
+(desktop + mobile app) the minute a wake is detected, for live debugging.
+See ADR 2.
+
 ## Boot task: the whole stack self-heals
 
 DSM reverts the binary and the arrays at every boot, so persistence is one
@@ -244,9 +273,10 @@ Task Scheduler entry (Triggered / Boot-up / root):
 
     bash /path/to/hibdbg.sh boot
 
-which runs `pollshim on` → `sysmig` → `sleepd start`, all idempotent.
-Post-update ritual: `audit` (component section states shim/daemon status)
-and `map` (arrays `[2/2]` NVMe-only) — or just check that *both* HDDs still
+which runs `fix shim on` → `fix sysmig` → `fix sleepd start` → `watch start`,
+all idempotent.
+Post-update ritual: `status` (shim/daemon/timer health) and `status map`
+(arrays `[2/2]` NVMe-only) — or just check that *both* HDDs still
 show the failed-system-partition warning.
 
 ## Verification
@@ -254,11 +284,12 @@ show the failed-system-partition warning.
 - `sleepnow [sec]` — forced-standby window with 5s-grain diskstats
   timeline, block_dump attribution, and a queue-level trace that includes
   passthrough; the acceptance test for the whole stack.
-- `rec [sec]` / `recsum DIR` / `recwakes DIR` / `recwho DIR COMM` —
+- `rec [sec]` / `rec sum DIR` / `rec wakes DIR` / `rec who DIR COMM` —
   hours-long detached recording; episode timeline, per-wake attribution
   table, and parent chains for short-lived helpers. A 24h run is the only
   way to separate scheduled wakes from your own access.
-- `state` / `lcc` — non-waking power state and SMART wear counters.
+- `status state` / `status lcc` — power state and SMART wear counters
+  (lcc skips sleeping drives; smartctl would wake them).
   The 24h `Start_Stop_Count` delta is the wear ledger: budgets are ~50k
   start/stop and 600k load/unload cycles; ~10–16 wakes/day ≈ 5k/year —
   a decade of headroom. The regime to avoid (and the reason `sleepd`
@@ -267,28 +298,33 @@ show the failed-system-partition warning.
 
 ## Script reference (grouped)
 
-    discovery      map (topology+mdstat+partitions), audit, sched
-    ground truth   live [s], rq [s], state, lcc [s], disks
-    attribution    who [pat] [s], md0/md0files [s], pollwho [s] [comm],
-                   fresh [min] [path], logs [s], hdd/sys/raw/tree/files/when
-    long recording rec [s], recstop, recsum DIR, recwakes DIR,
-                   recwho DIR COMM
-    one-shot       sleepnow [s] [nopoll], probe, rootspace
-    mitigation     quiesce/unquiesce, sysmig, pollshim on|off|status,
-                   sleepd start|stop|status, boot,
-                   hib [min|undo], hibdebug on|off, calm/uncalm, calm3/uncalm3
-    smb / nfs / hiblog
+    status         health page; subverbs state, live [s], lcc [s], map,
+                   audit, disks, probe
+    who            attribution: who [pat] [s], who rq [s],
+                   who forks [s] [comm], who fresh [min] [path]
+    rec            long recording: rec [s], rec stop, rec sum DIR,
+                   rec wakes DIR, rec who DIR COMM
+    sleepnow       forced-standby acceptance test: sleepnow [s] [nopoll]
+    watch          wake-notify daemon: start/stop/status,
+                   mode [digest|perwake], digest, test
+    hib            idle timer: hib [min|undo]
+    fix            mitigations: shim on|off|status, sysmig,
+                   sleepd start|stop|status, quiesce/unquiesce,
+                   calm [s|off], calm3 [s|off]
+    dsm            DSM-side: debug on|off, log [n], sched, smb, nfs
+    boot           re-assert the whole stack
 
 ## Undo, complete list
 
 | Change | Undo |
 |---|---|
-| System partition on NVMe (`sysmig`) | Storage Manager "Repair", or `mdadm --grow -n 4` + re-add sata members |
-| `pollshim` | `pollshim off` (restores original binary); any reboot also reverts it |
-| `sleepd` | `sleepd stop`; delete the boot task to stop re-asserting |
+| System partition on NVMe (`fix sysmig`) | Storage Manager "Repair", or `mdadm --grow -n 4` + re-add sata members |
+| Poll shim (`fix shim on`) | `fix shim off` (restores original binary); any reboot also reverts it |
+| `sleepd` | `fix sleepd stop`; delete the boot task to stop re-asserting |
 | Idle timer (`hib MIN`) | `hib undo` |
-| Indexing off (`quiesce`) | `unquiesce` |
-| Commit batching (`calm`/`calm3`) | `uncalm` / `uncalm3` |
+| Indexing off (`fix quiesce`) | `fix unquiesce` |
+| Commit batching (`fix calm`/`fix calm3`) | `fix calm off` / `fix calm3 off` |
+| Wake notifications (`watch`) | `watch stop`; delete the digest mail task |
 | Whole stack | remove the Task Scheduler entry and reboot: DSM restores everything itself |
 
 ## Closing notes

@@ -58,7 +58,7 @@ the two never-populated bay slots' degraded state).
 - **DSM re-adds HDD members at EVERY BOOT** (empirically confirmed
   2026-07-27; not just updates as originally assumed). A Task Scheduler
   boot task running `hibdbg.sh boot` re-strips them automatically
-  (`pollshim on` + `sysmig` + `sleepd start`, all idempotent). Cost: one
+  (`fix shim on` + `fix sysmig` + `fix sleepd start`, all idempotent). Cost: one
   ~8GB system-partition resync onto the HDDs per boot before the strip.
 - Health signature: BOTH HDDs showing "system partition failed" in Storage
   Manager = correct state. One or zero warnings = DSM re-adopted a drive.

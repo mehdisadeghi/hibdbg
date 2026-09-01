@@ -1,5 +1,50 @@
 # Architecture decisions
 
+## ADR 2: `watch` — armed-while-asleep tracing, digest mail via Task Scheduler
+
+2026-09-01
+
+### Context
+
+Wakes need attribution *and* notification, but the waker is only identifiable
+if instrumentation was running before the wake — and the decisive wake class
+is ATA passthrough, invisible to diskstats and block_dump. A permanent `rec`
+is not an option: it stops syslog-ng and writes ~3 GB/day. For delivery, DSM
+already has working email alerts, but exposes no CLI to its configured SMTP
+(`/etc/ssmtp/ssmtp.conf` ships empty; `synonotify` sends only canned event
+templates).
+
+### Decision
+
+A permanent daemon (`watch`, started by `boot`) keeps a private ftrace
+instance (`instances/hibwatch`) armed on `block_rq_issue` filtered to the
+sata queues: a RAM ring, no disk I/O, and separate enable/filter files so
+`rec`, `who rq`, and `sleepnow` keep working unchanged. Drive state is
+sampled once a minute with non-waking `hdparm -C`; any queue command not
+issued by the stack's own probes (`hdparm`, `sg_raw*`) while a drive was in
+standby on the previous sample is appended to `watch.log` as an episode with
+its issuer and CDB.
+
+Notification is digest-first: a daily DSM Task Scheduler task runs
+`watch digest` with "Send run details by email" — Synology's own mail, no
+credentials duplicated. `watch mode perwake` adds an immediate DSM
+notification (`synodsmnotify`) per wake for live debugging; that binary
+accepts only i18n string keys, so `watch start` registers a `[hibdbg]`
+section in DSM's strings file (re-asserted at boot; DSM updates overwrite
+it) and the push text is static — attribution stays in `watch.log` and the
+digest. Per-wake *email* is deliberately not implemented.
+
+### Consequences
+
+- Attribution is issuer comm + CDB only; parent chains need `rec who`
+  (fork tracing is the 3 GB/day component and stays out of the daemon).
+- Wakes and re-sleeps completing between two 60s samples are still caught:
+  the evidence is the ring content, not the state transition.
+- Requires ftrace instance support in the kernel; the daemon refuses to
+  start without it rather than fighting other tracers over the main buffer.
+- One episode may cover several wakes inside a minute (natural collapse —
+  a churn storm cannot spam notifications).
+
 ## ADR 1: `sleepd` takes its idle timer from DSM's `standbytimer`
 
 2026-08-12

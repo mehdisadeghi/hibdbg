@@ -10,27 +10,28 @@ on any DSM 7.x box. Run as root on the NAS.
 ## Deploy
 
     make deploy            # scp to $HOST (default synas.local) login home
-    make run CMD="live 60" # run a subcommand remotely
+    make run CMD="status"  # run a subcommand remotely
     make check             # bash -n
 
 ## Use
 
     sudo ./hibdbg.sh                 # full command reference
-    sudo ./hibdbg.sh audit           # component + writer status
+    sudo ./hibdbg.sh status          # health page: state, timer, stack, standbys
+    sudo ./hibdbg.sh status audit    # component + writer status
     sudo ./hibdbg.sh rec 86400       # day-long background recorder
-    sudo ./hibdbg.sh recsum DIR      # episode timeline + attribution
-    sudo ./hibdbg.sh recwakes DIR    # per-wake: duration, I/O, what woke it
+    sudo ./hibdbg.sh rec wakes DIR   # per-wake: duration, I/O, what woke it
+    sudo ./hibdbg.sh rec sum DIR     # episode timeline + attribution
     sudo ./hibdbg.sh sleepnow 120    # forced-standby acceptance test
-    sudo ./hibdbg.sh rootspace       # what is filling the 8G system partition
+    sudo ./hibdbg.sh watch start     # wake-notify daemon (see watch --help)
 
 Recordings land next to the script — keep it on an SSD volume, not on the
 drives under test.
 
 Mitigation stack (see GUIDE.md for the reasoning):
 
-    sudo ./hibdbg.sh sysmig          # OS arrays md0/md1 -> NVMe
-    sudo ./hibdbg.sh pollshim on     # cache scemd SCT polls while asleep
-    sudo ./hibdbg.sh sleepd start    # idle-timer standby daemon
+    sudo ./hibdbg.sh fix sysmig      # OS arrays md0/md1 -> NVMe
+    sudo ./hibdbg.sh fix shim on     # cache scemd SCT polls while asleep
+    sudo ./hibdbg.sh fix sleepd start # idle-timer standby daemon
     sudo ./hibdbg.sh boot            # all three, idempotent
 
 DSM reverts the binary shim and array membership at every boot: register a

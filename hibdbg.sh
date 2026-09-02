@@ -11,12 +11,25 @@ SLEEPLOG=$RECBASE/sleepd.log
 WLOG=$RECBASE/watch.log
 WMODE=$RECBASE/.watch_mode
 WMARK=$RECBASE/.watch_mark
+WGEN=$RECBASE/.watch_gen
+RUNDIR=/run/hibdbg
+WPID=$RUNDIR/watch.pid
+SPID=$RUNDIR/sleepd.pid
 
 die() { echo "$*" >&2; exit 1; }
 
 num() { case "$1" in ''|*[!0-9]*) die "$2: expected a number, got '$1'" ;; esac; }
 
 denoise() { grep -vE 'ppid:[0-9]+\(syno_hibernatio' || true; }
+
+# daemon liveness via pidfile: /run clears at boot (no stale files survive a
+# reboot); the cmdline check guards against pid reuse
+alive() { # alive PIDFILE TAG -> prints the pid; fails if not running
+	local pid
+	pid=$(cat "$1" 2>/dev/null) || return 1
+	grep -qa "$2" "/proc/$pid/cmdline" 2>/dev/null || return 1
+	echo "$pid"
+}
 
 hdd_dms() {
 	local d name deps sub md
@@ -56,6 +69,46 @@ rqfilter() {
 # single-pass aggregation: a queue-command storm makes block.log too big to sort
 rq_agg() { sed -E 's/.*block_rq_issue: ([0-9]+,[0-9]+) ([A-Z]*).*\[([^]]*)\]$/\1 \2 \3/' \
 	| awk '{n[$0]++} END{for(k in n) printf "%7d %s\n", n[k], k}' | sort -rn; }
+
+# HDD-backed mounted filesystems, one "mountpoint fstype" per line
+hdd_mnts() {
+	local d
+	{ for d in $(hdd_dms); do echo "/dev/mapper/$(cat "/sys/block/$d/dm/name")"; done
+	  for d in /sys/block/md*; do
+		ls "$d/slaves" 2>/dev/null | grep -q sata && echo "/dev/$(basename "$d")"
+	  done; } | grep -Ff - /proc/mounts | awk '{print $2, $3}' | sort -u || true
+}
+
+# fs hooks, dispatched on fstype: fsmark_<fs> prints a cheap change cursor,
+# fsdiff_<fs> MNT CUR prints the paths changed since it. Hooks come in pairs;
+# a filesystem without one gets no file attribution (the generic headline).
+fsmark_btrfs() { # fs-wide transid; a huge gen lists nothing, just the marker
+	btrfs subvolume find-new "$1" 9999999999 2>/dev/null | tail -1 | awk '{print $NF}'
+}
+fsdiff_btrfs() { # find-new does not recurse: also diff each share subvolume
+	# (a subvolume root is always inode 256); RO snapshots error out silently
+	local mnt=$1 gen=$2 d
+	for d in "$mnt" "$mnt"/*/; do
+		d=${d%/}
+		[ "$(stat -c %i "$d" 2>/dev/null)" = 256 ] || continue
+		btrfs subvolume find-new "$d" "$gen" 2>/dev/null \
+		| awk -v m="$d" '$1=="inode"{print m"/"$NF}'
+	done
+}
+
+fs_mark() { # refresh cursors; caller guarantees every drive is spinning
+	hdd_mnts | while read -r mnt fst; do
+		declare -F "fsmark_$fst" >/dev/null || continue
+		echo "$mnt $fst $("fsmark_$fst" "$mnt")"
+	done > "$WGEN"
+}
+fs_diff() { # paths changed since the recorded cursors
+	[ -f "$WGEN" ] || return 0
+	while read -r mnt fst cur; do
+		[ -n "${cur:-}" ] || continue
+		"fsdiff_$fst" "$mnt" "$cur"
+	done < "$WGEN" | sort -u
+}
 
 # parent chains for COMM execs found in a fork/exec trace file
 forkchain() {
@@ -263,6 +316,13 @@ states, and the first queue commands with their issuing process -- including
 ATA passthrough, the wake class invisible to every other layer. Deep-dive a
 named issuer with rec / rec who.
 
+Buffered writes reach the queue as anonymous kernel plumbing (dmcrypt_write,
+kworker), so the daemon also keeps a per-filesystem change cursor while the
+drives spin and diffs it at wake time to name the files written while asleep.
+On btrfs the cursor is the transaction id (subvolume find-new: instant, pure
+metadata); other filesystems need an fsmark_<fs>/fsdiff_<fs> hook pair in the
+script or get no file attribution.
+
   mode digest   (default) episodes only collect in watch.log. For the daily
                 mail, create a DSM task that Synology mails with its own
                 configured email -- Control Panel > Task Scheduler > Create >
@@ -395,8 +455,8 @@ status)	case "${2:-}" in
 		echo "standbytimer: $(synogetkeyvalue /etc/synoinfo.conf standbytimer 2>/dev/null || echo '?')m (0 = off)"
 		grep -q pollshim /usr/syno/bin/sg_raw 2>/dev/null \
 			&& echo "pollshim: installed" || echo "pollshim: NOT installed (stock sg_raw)"
-		pgrep -f 'hibdbg.sh _sleepd' >/dev/null \
-			&& echo "sleepd:   running" || echo "sleepd:   NOT running"
+		pid=$(alive "$SPID" _sleepd) \
+			&& echo "sleepd:   running (pid $pid)" || echo "sleepd:   NOT running"
 		printf 'dsm debug: '
 		[ "$(synogetkeyvalue /etc/synoinfo.conf enable_hibernation_debug 2>/dev/null)" = yes ] \
 			&& echo "on (arms block_dump; dsm debug off)" || echo "off"
@@ -486,8 +546,8 @@ status)	case "${2:-}" in
 		echo "== hibdbg components (re-check after every DSM update) =="
 		grep -q pollshim /usr/syno/bin/sg_raw 2>/dev/null \
 			&& echo "pollshim: installed" || echo "pollshim: NOT installed (stock sg_raw)"
-		pgrep -f 'hibdbg.sh _sleepd' >/dev/null \
-			&& echo "sleepd:   running" || echo "sleepd:   not running" ;;
+		pid=$(alive "$SPID" _sleepd) \
+			&& echo "sleepd:   running (pid $pid)" || echo "sleepd:   not running" ;;
 	disks)	# model / serial / firmware per drive. smartctl wakes a sleeping
 		# drive even with -n standby (IDENTIFY precedes the check): skip.
 		for d in /dev/sata[0-9]*; do
@@ -951,16 +1011,20 @@ fix)	case "${2:-}" in
 		start)
 			grep -q pollshim /usr/syno/bin/sg_raw 2>/dev/null \
 				|| die "pollshim not installed; refusing (polls would wake drives)"
-			if pgrep -f 'hibdbg.sh _sleepd' >/dev/null; then
-				echo "already running"; exit 0
+			if pid=$(alive "$SPID" _sleepd); then
+				echo "already running (pid $pid)"; exit 0
 			fi
 			setsid "$0" _sleepd >/dev/null 2>&1 < /dev/null &
 			cur=$(synogetkeyvalue /etc/synoinfo.conf standbytimer 2>/dev/null)
 			echo "sleepd started (standbytimer ${cur:-0}m -> standby; 0 = off)"
-			echo "persist: Task Scheduler > Triggered > Boot-up > root:"
-			echo "  $(readlink -f "$0") fix sleepd start" ;;
-		stop)	pkill -f 'hibdbg.sh _sleepd' && echo "stopped" || echo "not running" ;;
-		status)	pgrep -f 'hibdbg.sh _sleepd' >/dev/null && echo "running" || echo "not running"
+			echo 'persist across reboots: covered by the "hibdbg.sh boot" boot-up task' ;;
+		stop)	if pid=$(alive "$SPID" _sleepd); then
+				kill "$pid" && echo "stopped (pid $pid)"
+			else
+				echo "not running"
+			fi ;;
+		status)	pid=$(alive "$SPID" _sleepd) \
+				&& echo "running (pid $pid)" || echo "not running"
 			"$0" status state
 			echo "-- standby issued (last 5 of $SLEEPLOG):"
 			tail -5 "$SLEEPLOG" 2>/dev/null || echo "  (none yet)" ;;
@@ -1020,7 +1084,10 @@ fix)	case "${2:-}" in
 	*)	die "usage: hibdbg fix shim|sysmig|sleepd|quiesce|unquiesce|calm|calm3 ..." ;;
 	esac ;;
 
-_sleepd) declare -A last prev
+_sleepd) mkdir -p "$RUNDIR"; echo $$ > "$SPID"
+	trap 'rm -f "$SPID"' EXIT
+	trap 'rm -f "$SPID"; trap - EXIT; exit 0' TERM INT
+	declare -A last prev
 	while :; do
 		# shim gone (boot/update restored stock sg_raw): polls wake drives
 		# again -> issuing standby would churn cycles; die, status shows it
@@ -1046,7 +1113,8 @@ _sleepd) declare -A last prev
 				fi
 			fi
 		done < <(grep -E ' sata[0-9]+ ' /proc/diskstats | awk '{print $3, $4, $8}')
-		sleep 60
+		# background + wait: TERM lands only after a foreground child exits
+		sleep 60 & wait $!
 	done ;;
 
 watch)	case "${2:-}" in
@@ -1055,16 +1123,21 @@ watch)	case "${2:-}" in
 		mkdir -p /sys/kernel/debug/tracing/instances/hibwatch 2>/dev/null \
 			|| die "kernel lacks ftrace instances; watch cannot coexist with other tracers"
 		watch_strings
-		if pgrep -f 'hibdbg.sh _watch' >/dev/null; then
-			echo "already running"; exit 0
+		if pid=$(alive "$WPID" _watch); then
+			echo "already running (pid $pid)"; exit 0
 		fi
 		setsid "$0" _watch >/dev/null 2>&1 < /dev/null &
 		echo "watch started (mode: $(cat "$WMODE" 2>/dev/null || echo digest); episodes -> $WLOG)"
 		echo "daily digest mail: Task Scheduler > Create > Scheduled task > root, daily:"
 		echo "  $(readlink -f "$0") watch digest"
 		echo "  + task settings: Send run details by email" ;;
-	stop)	pkill -f 'hibdbg.sh _watch' && echo "stopped" || echo "not running" ;;
-	status)	pgrep -f 'hibdbg.sh _watch' >/dev/null && echo "running" || echo "not running"
+	stop)	if pid=$(alive "$WPID" _watch); then
+			kill "$pid" && echo "stopped (pid $pid)"
+		else
+			echo "not running"
+		fi ;;
+	status)	pid=$(alive "$WPID" _watch) \
+			&& echo "running (pid $pid)" || echo "not running"
 		echo "mode: $(cat "$WMODE" 2>/dev/null || echo digest)"
 		echo "-- last episodes ($WLOG):"
 		tail -20 "$WLOG" 2>/dev/null || echo "  (none yet)" ;;
@@ -1103,9 +1176,11 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 	# non-waking probes while a drive was in standby on the last sample.
 	T=/sys/kernel/debug/tracing/instances/hibwatch
 	mkdir -p "$T" 2>/dev/null || exit 1
+	mkdir -p "$RUNDIR"; echo $$ > "$WPID"
 	cleanup() {
 		echo 0 > "$T/events/block/block_rq_issue/enable" 2>/dev/null
 		rmdir "$T" 2>/dev/null
+		rm -f "$WPID"
 	}
 	trap cleanup EXIT
 	trap 'cleanup; trap - EXIT; exit 0' TERM INT
@@ -1120,11 +1195,19 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 			if [ -n "$ev" ]; then
 				# headline: name the waker when a userspace comm reached the
 				# queue; buffered writes surface only as kernel plumbing (the
-				# dm/md boundary strips the origin) -> say so, don't guess
+				# dm/md boundary strips the origin) -> name the changed file
+				files=$(fs_diff)
 				top=$(echo "$ev" | rq_agg \
 					| awk '$4 !~ /^(kworker|irq\/|dmcrypt|btrfs|md[0-9]|jbd2|flush)/ {print $4; exit}')
+				if [ -z "$top" ] && [ -n "$files" ]; then
+					top="a write to $(echo "$files" | head -1)"
+				fi
 				{ date "+== %F %T wake: ${top:-a buffered write to the HDD volume} woke your device"
 				  "$0" status state
+				  if [ -n "$files" ]; then
+					echo "-- files changed since the drives went to sleep:"
+					echo "$files" | head -20
+				  fi
 				  echo "$ev" | rq_agg | head -5
 				  echo "$ev" | head -5
 				} >> "$WLOG"
@@ -1145,6 +1228,11 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 			*standby*|*sleeping*) sleepy=$((sleepy+1)) ;;
 			esac
 		done
+		# cursors are refreshed only while every drive spins: querying fs
+		# metadata against a sleeping drive could itself wake it
+		if [ "$sleepy" -eq 0 ]; then
+			fs_mark
+		fi
 		# background + wait: bash delivers TERM only after a foreground
 		# child exits, which made stop take up to a full minute
 		sleep 60 & wait $!

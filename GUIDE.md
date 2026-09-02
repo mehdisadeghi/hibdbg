@@ -258,6 +258,14 @@ arrives while a drive was in standby (excluding the stack's own probes) is
 an episode: wallclock, drive states, and the first commands with their
 issuing process land in `watch.log`, passthrough included.
 
+Buffered writes reach the queue as anonymous plumbing (`dmcrypt_write`,
+`kworker`) — the btrfs → md → dm-crypt stack strips the originator — so the
+daemon also keeps a change cursor per HDD-backed filesystem while the drives
+spin and diffs it at wake time: the episode lists the files written while
+asleep, and the headline names the first one. On btrfs the cursor is the
+transaction id (`btrfs subvolume find-new`, instant metadata delta); other
+filesystems take an `fsmark_<fs>`/`fsdiff_<fs>` hook pair. See ADR 3.
+
 Notification reuses Synology's own mail rather than duplicating SMTP
 credentials: DSM 7 exposes no CLI to its configured mailer (ssmtp.conf
 ships empty), but Task Scheduler mails a task's output. A daily root task

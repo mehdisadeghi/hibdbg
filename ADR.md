@@ -1,5 +1,59 @@
 # Architecture decisions
 
+## ADR 4: daemons are managed by pidfiles under /run, not pgrep
+
+2026-09-02
+
+`watch` and `sleepd` were located with `pgrep -f 'hibdbg.sh _watch'`:
+pattern-dependent (breaks if the script is renamed), no pid to inspect, and
+`stop` was a blind `pkill`. Replaced with the conventional mechanism: each
+daemon writes `/run/hibdbg/<name>.pid`, removed on exit. Liveness is the
+pidfile plus a `/proc/<pid>/cmdline` check (pid reuse guard); `/run` is
+tmpfs, so no stale pidfile survives a reboot. `stop` kills exactly that pid;
+`status` prints it. Daemons started by pre-pidfile builds are invisible to
+the new `stop` — kill them once by hand; no pgrep fallback is kept.
+
+## ADR 3: buffered-write wakes are named by fs change cursors, not tracing
+
+2026-09-02
+
+### Context
+
+ADR 2 accepted issuer-comm-only attribution, and the first night of digests
+showed its limit: every wake was a small (~25 KB) buffered write surfacing at
+the sata queue as `dmcrypt_write`/`kworker` — the btrfs → md → dm-crypt stack
+strips the originator, so the queue can never name this wake class. Naming it
+from the process side would need `writeback_dirty_inode` tracing plus inode
+resolution; heavier, and the user-facing question is "what was written",
+which the filesystem itself can answer.
+
+### Decision
+
+The daemon keeps a change cursor per HDD-backed mounted filesystem,
+refreshed each minute — but only while every drive spins, since querying fs
+metadata against a sleeping drive could itself wake it. At wake time it diffs
+the cursor and logs the paths written while asleep; when no userspace comm
+reached the queue, the headline names the first changed path instead of the
+generic buffered-write line.
+
+Cursor and diff are fs hooks dispatched on fstype (`fsmark_<fs>` /
+`fsdiff_<fs>` pairs). btrfs implements them via the fs-wide transaction id
+and `btrfs subvolume find-new` — an instant metadata delta, no tree walk, no
+tracing; find-new does not recurse, so each share subvolume (root inode 256)
+is diffed alongside the volume root. A filesystem without a hook pair keeps
+the generic headline.
+
+### Consequences
+
+- Attribution is file-level, not process-level: the path names the app in
+  practice. If ever ambiguous, `writeback_dirty_inode` in the hibwatch
+  instance is the escalation, not the default.
+- Pure-metadata wakes (renames, timestamps, md superblock housekeeping)
+  produce an empty diff and fall back to the generic headline: find-new
+  reports data extents.
+- The cursor lags the last awake minute by at most 60 s, so a diff can
+  include that final pre-sleep tail alongside the wake writes.
+
 ## ADR 2: `watch` — armed-while-asleep tracing, digest mail via Task Scheduler
 
 2026-09-01

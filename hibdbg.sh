@@ -76,7 +76,10 @@ hdd_mnts() {
 	{ for d in $(hdd_dms); do echo "/dev/mapper/$(cat "/sys/block/$d/dm/name")"; done
 	  for d in /sys/block/md*; do
 		ls "$d/slaves" 2>/dev/null | grep -q sata && echo "/dev/$(basename "$d")"
-	  done; } | grep -Ff - /proc/mounts | awk '{print $2, $3}' | sort -u || true
+	  done; } | grep -Ff - /proc/mounts \
+	| awk '!seen[$1]++ {print $2, $3}' || true
+	# one mount per device: bind mounts (ContainerManager all_shares) list the
+	# same fs again under an alias path; the first mount is the real one
 }
 
 # fs hooks, dispatched on fstype: fsmark_<fs> prints a cheap change cursor,
@@ -92,7 +95,12 @@ fsdiff_btrfs() { # find-new does not recurse: also diff each share subvolume
 		d=${d%/}
 		[ "$(stat -c %i "$d" 2>/dev/null)" = 256 ] || continue
 		btrfs subvolume find-new "$d" "$gen" 2>/dev/null \
-		| awk -v m="$d" '$1=="inode"{print m"/"$NF}'
+		| awk -v m="$d" '$1=="inode" {
+			# the path is everything after the fixed fields: $NF would
+			# truncate filenames containing spaces to their last word
+			sub(/^inode [0-9]+ file offset [0-9]+ len [0-9]+ disk start [0-9]+ offset [0-9]+ gen [0-9]+ flags [^ ]+ /, "")
+			print m"/"$0
+		}'
 	done
 }
 

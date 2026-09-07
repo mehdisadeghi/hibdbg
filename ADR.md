@@ -1,5 +1,49 @@
 # Architecture decisions
 
+## ADR 5: read wakes are named by page-cache misses and /proc, in that order
+
+2026-09-07
+
+### Context
+
+ADR 3 named written files from the btrfs change cursor, and the digests that
+followed split the wakes in two. Writes were solved; reads were not. A read
+wake shows a comm at the queue (`nfsd`, `libuv-worker`) but no path, because
+`find-new` reports written extents only -- and the comm is a thread name, not
+an application: `libuv-worker` is any Node process, `nfsd` is a kernel thread
+whose real requester is a machine on the network.
+
+### Decision
+
+Reads that reach a sleeping disk are page-cache misses by definition, so a
+second ftrace instance (`instances/hibread`) records
+`mm_filemap_add_to_page_cache`, filtered to the HDD filesystems' `s_dev` and
+armed only while a drive sleeps. Each record carries reader and inode; a new
+`fsino_<fs>` hook turns the inode into a path (btrfs: `inspect-internal
+inode-resolve`, backref lookup, no tree walk).
+
+The issuer is resolved at wake time from `/proc` alone -- cmdline, parent, and
+docker container id from the cgroup -- while the process that issued the
+command still exists. `nfsd` additionally logs the live NFS peers, falling
+back to the export table's client list.
+
+### Consequences
+
+- The read side gets its own ring: the spin-up requeue storm reaches ~20k
+  lines in `hibwatch` and would evict the record that explains the wake.
+- Arming is sleep-gated. The tracepoint fires on every cached read of the
+  volume, which is unbearable while awake and exactly the wake evidence while
+  asleep.
+- If the filter cannot be installed the daemon leaves read tracing off for
+  its lifetime rather than recording unfiltered: no attribution beats a
+  flooded ring. Kernels without the tracepoint keep the queue-only headline.
+- Attribution is resolved live, so it is only as good as the process still
+  being alive one sample later. A short-lived reader leaves the path (from
+  the fs hook) but no chain.
+- `O_DIRECT` reads bypass the page cache and stay unnamed; btrfs metadata
+  reads resolve to no path.
+
+
 ## ADR 4: daemons are managed by pidfiles under /run, not pgrep
 
 2026-09-02

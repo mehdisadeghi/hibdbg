@@ -31,6 +31,41 @@ alive() { # alive PIDFILE TAG -> prints the pid; fails if not running
 	echo "$pid"
 }
 
+# the queue names a thread; /proc names the app. Reads only /proc, so it costs
+# no volume I/O and can run while the drives are still spinning up.
+whois() { # whois PID -> "cmd < parent(ppid) [docker <id>]", empty if pid is gone
+	local pid=$1 cmd ppid out cid
+	[ -d "/proc/$pid" ] || return 0
+	# stat field 4 is ppid, but the comm in field 2 may hold spaces
+	ppid=$(sed -E 's/.*\) [A-Za-z] //' "/proc/$pid/stat" 2>/dev/null | awk '{print $1}')
+	cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-60)
+	# kernel threads have an empty cmdline
+	out="${cmd:-[$(cat "/proc/$pid/comm" 2>/dev/null)]}"
+	if [ -n "${ppid:-}" ] && [ "$ppid" != 0 ]; then
+		out="$out < $(cat "/proc/$ppid/comm" 2>/dev/null)($ppid)"
+	fi
+	cid=$(sed -nE 's|.*/docker[-/]([0-9a-f]{12}).*|\1|p' "/proc/$pid/cgroup" 2>/dev/null | head -1)
+	echo "${out}${cid:+ [docker $cid]}"
+}
+
+# nfsd is a kernel thread: the requester is a remote host, named by the live
+# connections, or failing those by who the export admits at all
+nfs_peers() {
+	local peers
+	peers=$(netstat -tn 2>/dev/null | awk '$4 ~ /:2049$/ {sub(/:[0-9]+$/,"",$5); print $5}' | sort -u)
+	if [ -n "$peers" ]; then
+		echo "$peers" | tr '\n' ' '
+	else
+		awk '$1 ~ /^\// {printf "%s(%s) ", $1, $2}' /proc/fs/nfs/exports 2>/dev/null
+	fi
+}
+
+devnum() { # kernel dev_t of a block device node (maj<<20|min)
+	local maj min
+	IFS=: read -r maj min <<< "$(stat -Lc '%t:%T' "$1" 2>/dev/null)"
+	echo $(( 0x${maj:-0} * 1048576 + 0x${min:-0} ))
+}
+
 hdd_dms() {
 	local d name deps sub md
 	for d in /sys/block/dm-*; do
@@ -70,21 +105,31 @@ rqfilter() {
 rq_agg() { sed -E 's/.*block_rq_issue: ([0-9]+,[0-9]+) ([A-Z]*).*\[([^]]*)\]$/\1 \2 \3/' \
 	| awk '{n[$0]++} END{for(k in n) printf "%7d %s\n", n[k], k}' | sort -rn; }
 
-# HDD-backed mounted filesystems, one "mountpoint fstype" per line
+# HDD-backed mounted filesystems, one "device mountpoint fstype" per line
 hdd_mnts() {
 	local d
 	{ for d in $(hdd_dms); do echo "/dev/mapper/$(cat "/sys/block/$d/dm/name")"; done
 	  for d in /sys/block/md*; do
 		ls "$d/slaves" 2>/dev/null | grep -q sata && echo "/dev/$(basename "$d")"
 	  done; } | grep -Ff - /proc/mounts \
-	| awk '!seen[$1]++ {print $2, $3}' || true
+	| awk '!seen[$1]++ {print $1, $2, $3}' || true
 	# one mount per device: bind mounts (ContainerManager all_shares) list the
 	# same fs again under an alias path; the first mount is the real one
 }
 
+# event filter matching those filesystems, for the page-cache tracepoint
+fmfilter() {
+	local dev mnt fst f=""
+	while read -r dev mnt fst; do
+		f="${f:+$f || }s_dev == $(devnum "$dev")"
+	done < <(hdd_mnts)
+	echo "$f"
+}
+
 # fs hooks, dispatched on fstype: fsmark_<fs> prints a cheap change cursor,
-# fsdiff_<fs> MNT CUR prints the paths changed since it. Hooks come in pairs;
-# a filesystem without one gets no file attribution (the generic headline).
+# fsdiff_<fs> MNT CUR prints the paths changed since it (the write side), and
+# fsino_<fs> MNT INO names an inode (the read side). A filesystem without them
+# gets no file attribution (the generic headline).
 fsmark_btrfs() { # fs-wide transid; a huge gen lists nothing, just the marker
 	btrfs subvolume find-new "$1" 9999999999 2>/dev/null | tail -1 | awk '{print $NF}'
 }
@@ -104,8 +149,12 @@ fsdiff_btrfs() { # find-new does not recurse: also diff each share subvolume
 	done
 }
 
+fsino_btrfs() { # first path holding the inode; backrefs, no tree walk
+	btrfs inspect-internal inode-resolve "$2" "$1" 2>/dev/null | head -1
+}
+
 fs_mark() { # refresh cursors; caller guarantees every drive is spinning
-	hdd_mnts | while read -r mnt fst; do
+	hdd_mnts | while read -r dev mnt fst; do
 		declare -F "fsmark_$fst" >/dev/null || continue
 		echo "$mnt $fst $("fsmark_$fst" "$mnt")"
 	done > "$WGEN"
@@ -116,6 +165,28 @@ fs_diff() { # paths changed since the recorded cursors
 		[ -n "${cur:-}" ] || continue
 		"fsdiff_$fst" "$mnt" "$cur"
 	done < "$WGEN" | sort -u
+}
+
+# reads that reach a sleeping disk are page-cache misses by definition, so the
+# filemap tracepoint sees every one: it names the reader and the inode, which
+# the fs hook turns into a path
+fs_reads() { # fs_reads TRACEFILE -> "comm path" per distinct inode read
+	local map dev mnt fst comm maj min ino hit p
+	# dev_t -> mount, resolved once: the trace identifies the fs by number
+	map=$(hdd_mnts | while read -r dev mnt fst; do
+		echo "$(devnum "$dev") $mnt $fst"
+	done)
+	sed -nE 's/^ *(.+)-[0-9]+ .*mm_filemap_add_to_page_cache: dev ([0-9]+):([0-9]+) ino ([0-9a-f]+).*/\1 \2 \3 \4/p' \
+		"$1" 2>/dev/null | sort -u | head -20 \
+	| while read -r comm maj min ino; do
+		hit=$(echo "$map" | awk -v d=$((maj*1048576+min)) '$1==d {print; exit}')
+		[ -n "$hit" ] || continue
+		fst=${hit##* }
+		mnt=${hit#* }; mnt=${mnt% *}
+		declare -F "fsino_$fst" >/dev/null || continue
+		p=$("fsino_$fst" "$mnt" $((0x$ino)))
+		if [ -n "$p" ]; then echo "$comm $p"; fi
+	done
 }
 
 # parent chains for COMM execs found in a fork/exec trace file
@@ -330,6 +401,14 @@ drives spin and diffs it at wake time to name the files written while asleep.
 On btrfs the cursor is the transaction id (subvolume find-new: instant, pure
 metadata); other filesystems need an fsmark_<fs>/fsdiff_<fs> hook pair in the
 script or get no file attribution.
+
+Reads leave no such trace, so a second ftrace instance records page-cache
+misses on the HDD filesystems (mm_filemap_add_to_page_cache), armed only while
+a drive sleeps -- when a miss is by definition the wake. It yields reader plus
+inode, and fsino_<fs> names the file (btrfs: inode-resolve). Whatever process
+the queue named is also resolved through /proc at wake time -- cmdline, parent
+and docker container -- and nfsd, a kernel thread, additionally logs the NFS
+client that asked.
 
   mode digest   (default) episodes only collect in watch.log. For the daily
                 mail, create a DSM task that Synology mails with its own
@@ -1147,6 +1226,12 @@ watch)	case "${2:-}" in
 	status)	pid=$(alive "$WPID" _watch) \
 			&& echo "running (pid $pid)" || echo "not running"
 		echo "mode: $(cat "$WMODE" 2>/dev/null || echo digest)"
+		fm=/sys/kernel/debug/tracing/instances/hibread/events/filemap
+		if [ -d "$fm/mm_filemap_add_to_page_cache" ]; then
+			echo "read attribution: available ($(cat "$fm/mm_filemap_add_to_page_cache/enable") = armed while asleep)"
+		else
+			echo "read attribution: unavailable (kernel lacks the filemap tracepoint)"
+		fi
 		echo "-- last episodes ($WLOG):"
 		tail -20 "$WLOG" 2>/dev/null || echo "  (none yet)" ;;
 	mode)	case "${3:-}" in
@@ -1184,10 +1269,18 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 	# non-waking probes while a drive was in standby on the last sample.
 	T=/sys/kernel/debug/tracing/instances/hibwatch
 	mkdir -p "$T" 2>/dev/null || exit 1
+	# page-cache misses go to their own ring: the spin-up requeue storm in
+	# hibwatch runs to ~20k lines and would evict the read record
+	TR=/sys/kernel/debug/tracing/instances/hibread
+	mkdir -p "$TR" 2>/dev/null || true
+	FM=$TR/events/filemap/mm_filemap_add_to_page_cache
+	[ -d "$FM" ] || FM=""
 	mkdir -p "$RUNDIR"; echo $$ > "$WPID"
 	cleanup() {
 		echo 0 > "$T/events/block/block_rq_issue/enable" 2>/dev/null
 		rmdir "$T" 2>/dev/null
+		if [ -n "$FM" ]; then echo 0 > "$FM/enable" 2>/dev/null; fi
+		rmdir "$TR" 2>/dev/null
 		rm -f "$WPID"
 	}
 	trap cleanup EXIT
@@ -1205,13 +1298,33 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 				# queue; buffered writes surface only as kernel plumbing (the
 				# dm/md boundary strips the origin) -> name the changed file
 				files=$(fs_diff)
+				reads=$(if [ -n "$FM" ]; then fs_reads "$TR/trace"; fi)
 				top=$(echo "$ev" | rq_agg \
 					| awk '$4 !~ /^(kworker|irq\/|dmcrypt|btrfs|md[0-9]|jbd2|flush)/ {print $4; exit}')
+				# the issuer pid is in the raw trace as comm-pid; resolve it
+				# now, while the process that issued the command still exists
+				pid=$(echo "$ev" | awk -v c="$top" \
+					'{f=$1; n=split(f,a,"-"); p=a[n]; sub("-" p "$","",f)
+					  if (f==c) {print p; exit}}')
+				who=$(if [ -n "${pid:-}" ]; then whois "$pid"; fi)
+				case "${top:-}" in
+				nfsd|lockd|nfsv4*) who="${who:+$who }clients: $(nfs_peers)" ;;
+				esac
+				if [ -z "$top" ] && [ -n "$reads" ]; then
+					top="a read of $(echo "$reads" | head -1 | cut -d' ' -f2-)"
+				fi
 				if [ -z "$top" ] && [ -n "$files" ]; then
 					top="a write to $(echo "$files" | head -1)"
 				fi
 				{ date "+== %F %T wake: ${top:-a buffered write to the HDD volume} woke your device"
 				  "$0" status state
+				  if [ -n "$who" ]; then
+					echo "-- issuer: ${top}${pid:+($pid)} $who"
+				  fi
+				  if [ -n "$reads" ]; then
+					echo "-- files read while asleep:"
+					echo "$reads" | head -20
+				  fi
 				  if [ -n "$files" ]; then
 					echo "-- files changed since the drives went to sleep:"
 					echo "$files" | head -20
@@ -1220,6 +1333,7 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 				  echo "$ev" | head -5
 				} >> "$WLOG"
 				echo > "$T/trace"
+				if [ -n "$FM" ]; then echo > "$TR/trace"; fi
 				if [ "$(cat "$WMODE" 2>/dev/null)" = perwake ]; then
 					# i18n keys only: the push is static, details in the log
 					synodsmnotify @administrators hibdbg:wake_title \
@@ -1240,6 +1354,23 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 		# metadata against a sleeping drive could itself wake it
 		if [ "$sleepy" -eq 0 ]; then
 			fs_mark
+		fi
+		# the page-cache tracepoint fires on every cached read, so it is
+		# armed only while a drive sleeps -- when a hit is by definition a
+		# wake. Both writes are idempotent, no transition state to keep.
+		if [ -n "$FM" ]; then
+			if [ "$sleepy" -gt 0 ]; then
+				# no filter, no tracing: unfiltered it would record
+				# every cached read on every filesystem
+				if fmfilter > "$FM/filter" 2>/dev/null; then
+					echo 1 > "$FM/enable"
+				else
+					FM=""
+				fi
+			else
+				echo 0 > "$FM/enable"
+				echo > "$TR/trace"
+			fi
 		fi
 		# background + wait: bash delivers TERM only after a foreground
 		# child exits, which made stop take up to a full minute

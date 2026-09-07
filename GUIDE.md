@@ -266,6 +266,16 @@ asleep, and the headline names the first one. On btrfs the cursor is the
 transaction id (`btrfs subvolume find-new`, instant metadata delta); other
 filesystems take an `fsmark_<fs>`/`fsdiff_<fs>` hook pair. See ADR 3.
 
+Reads leave no cursor behind, so they get the mirror mechanism: a second
+ftrace instance records page-cache misses on those filesystems
+(`mm_filemap_add_to_page_cache`), armed only while a drive sleeps — a read
+that reaches a sleeping disk is a cache miss by definition. The record names
+reader and inode, and `fsino_<fs>` resolves the inode to a path (btrfs:
+`inspect-internal inode-resolve`). Whatever comm the queue saw is a thread
+name, so the episode also resolves it through `/proc` at wake time — cmdline,
+parent, docker container — and for `nfsd`, a kernel thread, logs the NFS
+client that asked. See ADR 5.
+
 Notification reuses Synology's own mail rather than duplicating SMTP
 credentials: DSM 7 exposes no CLI to its configured mailer (ssmtp.conf
 ships empty), but Task Scheduler mails a task's output. A daily root task

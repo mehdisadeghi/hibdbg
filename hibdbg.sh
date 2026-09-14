@@ -277,11 +277,10 @@ configure and mitigate
   hib [MIN|undo]               show or set the idle timer (minutes)
   fix shim on|off|status       cache scemd temp polls so standby holds
   fix sleepd start|stop|status the standby daemon itself
-  fix sysmig                   move DSM system partition HDD -> NVMe
   fix quiesce|unquiesce        disable / restore indexing daemons
   fix calm [sec|off]           batch system-partition (md0) writes
   fix calm3 [sec|off]          batch volume3 btrfs commits
-  boot                         re-assert shim+sysmig+sleepd+watch (boot task)
+  boot                         re-assert shim+sleepd+watch (boot task)
 
 inspect DSM
   status map                   device topology (dm, md, partitions)
@@ -462,15 +461,6 @@ usage: hibdbg fix <sub>
      wake the drive. "on" is idempotent; DSM restores the stock binary at
      every boot (status and audit report it).
 
-  sysmig
-     Migrates the DSM system arrays (md0 = /, md1 = swap) off the HDDs onto
-     the NVMe system partitions, one safe step per run -- re-run until it
-     reports done. DSM mirrors its OS onto every data drive, so the root
-     filesystem alone keeps the HDDs awake regardless of which userspace
-     writers you silence. Afterwards Storage Manager permanently shows
-     "system partition failed" on BOTH HDDs: that is the correct state, and
-     Repair is the undo button. See SYSMIG.md.
-
   sleepd start|stop|status
      DIY standby daemon with hd-idle semantics: watches /proc/diskstats and
      issues hdparm -y per drive after standbytimer idle minutes. The timer is
@@ -494,10 +484,10 @@ EOF
 	dsm) cat <<'EOF'
 usage: hibdbg dsm <sub>
 
-  debug on|off  DSM's own hibernation debug logging (safe for the HDDs since
-                sysmig, but it arms block_dump behind the recorder's back:
-                keep it off while any hibdbg instrument runs). Restarting
-                scemd resets DSM's idle clock.
+  debug on|off  DSM's own hibernation debug logging. It writes to /var/log
+                on md0, i.e. to the HDDs, and arms block_dump behind the
+                recorder's back: keep it off while any hibdbg instrument
+                runs. Restarting scemd resets DSM's idle clock.
   log [n]       scemd's hibernation decisions and wake reasons (def 40 lines)
   sched         crontab, synocrond jobs, smart self-test schedules
   smb           SMB client sessions and locks
@@ -507,12 +497,13 @@ EOF
 	boot) cat <<'EOF'
 usage: hibdbg boot
 
-Re-asserts the whole stack, idempotently: fix shim on, fix sysmig,
-fix sleepd start, watch start.
+Re-asserts the whole stack, idempotently: fix shim on, fix sleepd start,
+watch start.
 
-DSM reverts the wrapper binary and re-adds the HDD members to md0/md1 at every
-boot, not just across updates. Register this as a Task Scheduler triggered
-task (Boot-up, user root) or the stack silently degrades after any reboot.
+DSM restores the stock wrapper binary at every boot, not just across updates,
+and /run (the daemons' pidfiles) is cleared. Register this as a Task Scheduler
+triggered task (Boot-up, user root) or the stack silently degrades after any
+reboot.
 EOF
 	;;
 	*)	die "unknown command: $1 (hibdbg --help for the list)" ;;
@@ -1050,46 +1041,6 @@ fix)	case "${2:-}" in
 			fi ;;
 		*)	die "usage: hibdbg fix shim on|off|status" ;;
 		esac ;;
-	sysmig)	# migrate DSM system arrays (md0=/, md1=swap) off the HDDs onto
-		# the NVMe system partitions. Idempotent: one safe step per run,
-		# re-run until both report done. Never click DSM's "Repair" after.
-		for pair in md0:1 md1:2; do
-			md=${pair%:*}; p=${pair#*:}
-			sync=$(cat "/sys/block/$md/md/sync_action")
-			nd=$(cat "/sys/block/$md/md/raid_disks")
-			slaves=" $(ls "/sys/block/$md/slaves" | tr '\n' ' ') "
-			if [ "$sync" != "idle" ]; then
-				echo "$md: $sync running; re-run when idle"; continue
-			fi
-			miss=""
-			for b in /sys/block/nvme[0-9]n1; do
-				d="$(basename "$b")p$p"
-				case "$slaves" in *" $d "*) ;; *) miss="$miss $d";; esac
-			done
-			if [ -n "$miss" ]; then
-				for d in $miss; do mdadm "/dev/$md" --add "/dev/$d"; done
-				echo "$md: added$miss; resync starting, re-run when idle"; continue
-			fi
-			satas=$(echo "$slaves" | tr ' ' '\n' | grep '^sata' || true)
-			nvme_ok=1
-			for b in /sys/block/nvme[0-9]n1; do
-				d="$(basename "$b")p$p"
-				grep -q in_sync "/sys/block/$md/md/dev-$d/state" 2>/dev/null || nvme_ok=0
-			done
-			if [ -n "$satas" ] && [ "$nvme_ok" != 1 ]; then
-				echo "$md: nvme members not all in_sync yet; re-run when resynced"
-				continue
-			fi
-			for d in $satas; do
-				mdadm "/dev/$md" --fail "/dev/$d" --remove "/dev/$d"
-				echo "$md: removed $d"
-			done
-			if [ "$nd" -gt 2 ]; then
-				mdadm --grow "/dev/$md" --raid-devices=2
-				echo "$md: shrunk to 2 slots"
-			fi
-			echo "$md: done, members:$(ls "/sys/block/$md/slaves" | tr '\n' ' ')"
-		done ;;
 	sleepd)	# DIY standby daemon (hd-idle semantics). Issues hdparm -y per
 		# drive after standbytimer idle minutes, re-read every cycle.
 		# Requires the shim, else scemd's polls wake the drives right back
@@ -1168,7 +1119,7 @@ fix)	case "${2:-}" in
 			echo "persist: Task Scheduler > Triggered > Boot-up > root:"
 			echo "  $(readlink -f "$0") fix calm3 $sec" ;;
 		esac ;;
-	*)	die "usage: hibdbg fix shim|sysmig|sleepd|quiesce|unquiesce|calm|calm3 ..." ;;
+	*)	die "usage: hibdbg fix shim|sleepd|quiesce|unquiesce|calm|calm3 ..." ;;
 	esac ;;
 
 _sleepd) mkdir -p "$RUNDIR"; echo $$ > "$SPID"
@@ -1378,9 +1329,9 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 	done ;;
 
 dsm)	case "${2:-}" in
-	debug)	# DSM's own hibernation debug logging. Harmless to HDDs since
-		# sysmig (md0 on NVMe), but it arms block_dump behind the
-		# recorder's back. Restarting scemd resets the idle clock.
+	debug)	# DSM's own hibernation debug logging: writes /var/log on md0
+		# (the HDDs) and arms block_dump behind the recorder's back.
+		# Restarting scemd resets the idle clock.
 		case "${3:-}" in
 		on)	synosetkeyvalue /etc/synoinfo.conf enable_hibernation_debug yes
 			synosetkeyvalue /etc/synoinfo.conf hibernation_debug_level 1
@@ -1420,12 +1371,10 @@ dsm)	case "${2:-}" in
 	*)	die "usage: hibdbg dsm debug|log|sched|smb|nfs ..." ;;
 	esac ;;
 
-boot)	# idempotent boot task. DSM reverts both hacks at boot: restores stock
-	# sg_raw AND re-adds HDD members to md0/md1 (system partition
-	# auto-repair). Re-assert all three. Task Scheduler:
-	# Triggered > Boot-up > root: /path/hibdbg.sh boot
+boot)	# idempotent boot task: DSM restores stock sg_raw at every boot and
+	# /run is cleared, so re-assert the shim and both daemons. Task
+	# Scheduler: Triggered > Boot-up > root: /path/hibdbg.sh boot
 	"$0" fix shim on
-	"$0" fix sysmig
 	"$0" fix sleepd start
 	"$0" watch start ;;
 

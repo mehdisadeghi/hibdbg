@@ -29,17 +29,15 @@ drives under test.
 
 Mitigation stack (see GUIDE.md for the reasoning):
 
-    sudo ./hibdbg.sh fix sysmig      # OS arrays md0/md1 -> NVMe
     sudo ./hibdbg.sh fix shim on     # cache scemd SCT polls while asleep
     sudo ./hibdbg.sh fix sleepd start # idle-timer standby daemon
-    sudo ./hibdbg.sh boot            # all three, idempotent
+    sudo ./hibdbg.sh boot            # shim + both daemons, idempotent
 
-DSM reverts the binary shim and array membership at every boot: register a
-Task Scheduler boot-up task (root) running `hibdbg.sh boot`.
+DSM reverts the binary shim at every boot: register a Task Scheduler boot-up
+task (root) running `hibdbg.sh boot`.
 
 ## Docs
 
 - `GUIDE.md`  — full field guide: method, culprits, fixes, verification, undo
-- `SYSMIG.md` — system-partition migration record and undo
 - `ADR.md`    — architecture decisions
 - `HANDOFF.md` — historical hunt notes

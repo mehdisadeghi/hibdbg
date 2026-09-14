@@ -11,10 +11,10 @@ Tested on: DS923+, DSM 7.3.2, 2x IronWolf 12TB (RAID1, encrypted btrfs
 volume) + 2x NVMe as a storage pool. Method transfers to any DSM 7.x box;
 culprits will differ per setup.
 
-**Fair warning:** the fixes below include unsupported mdadm surgery on the
-DSM system partition and a wrapped Synology binary. Both are reversible and
-both are re-verified automatically at every boot, but it is your array and
-your risk.
+**Fair warning:** the fixes below include a wrapped Synology binary and a
+daemon that spins your drives down behind DSM's back. Both are reversible
+and re-asserted automatically at every boot, but it is your array and your
+risk.
 
 ---
 
@@ -33,8 +33,7 @@ don't remove it. The only silence is standby.
    barriers.
 2. **The observer effect is everywhere.** `block_dump` tracing feeds
    syslog-ng which writes to `/var/log` — on `md0` — generating the writes
-   you're tracing. DSM's own hibernation debug mode is itself a top writer
-   (until the system partition moves off the HDDs; then it becomes usable).
+   you're tracing. DSM's own hibernation debug mode is itself a top writer.
    An open Storage Manager tab polls storage APIs, which re-reads encrypted
    volumes' LUKS headers from disk.
 3. **Some wakers are invisible to standard tools.** SG_IO/ATA-passthrough
@@ -45,8 +44,8 @@ don't remove it. The only silence is standby.
    drive that *you* put in standby behind scemd's back. Days of ghost-chasing
    originate from this single fact.
 5. **DSM heals itself at every boot.** Not just updates: each boot restores
-   modified system binaries and re-adds HDD members to the system arrays.
-   Any mitigation must be re-asserted by a boot task.
+   modified system binaries, and assembles the system arrays from the SATA
+   bays alone (Fix 1). Any mitigation must be re-asserted by a boot task.
 6. **The hibernation policy veto is silent.** With zero HDD I/O for hours,
    timer set, and debug mode active in "can't enter hibernation" mode, the
    debug log stays empty and the drives stay awake: the veto (NVMe pool
@@ -75,8 +74,8 @@ this guide:
   it.
 - **Boot re-materializes the OS.** GRUB and systemd are FOSS, but DSM
   re-extracts/verifies system files from packed images at every boot and
-  re-runs system-partition auto-repair. Modified binaries and array
-  membership silently revert. Consequence: on DSM you get full
+  assembles the system arrays from a fixed list of SATA partitions. Modified
+  binaries and array membership silently revert. Consequence: on DSM you get full
   *observability*, substantial *control*, and only **provisional
   persistence** — durable changes are re-assertion hooks (boot tasks), not
   one-time edits.
@@ -132,7 +131,8 @@ Per-setup checklist, not a verdict for yours:
    `queue`) were still under the HDD MainDir, rewriting every 15 minutes.
 5. **DSM hibernation debug mode** as md0 load (pre-migration).
 6. **Storage Manager browser tabs** — LUKS header reads every ~5s while open.
-7. **The system partition itself** (structural — Fix 1).
+7. **The system partition itself** (structural; migrating it off the
+   HDDs was tried and withdrawn — Fix 1).
 8. **scemd's SCT temperature polls** (the invisible standby-killer — Fix 3).
 9. **An external API poller**: something queried `SYNO.Core.Storage` every
    15 minutes (here: a Home-Assistant-class integration); each query spawns
@@ -169,28 +169,29 @@ btrfs `auto_reclaim_space` housekeeping episodes (Synology-internal, no
 exposed tuning knob worth touching; `commit=` batching exists via `fix calm3`
 but batching cannot produce standby, only fewer bursts).
 
-## Fix 1: move the DSM system partition off the HDDs (`fix sysmig`)
+## Fix 1: the system partition off the HDDs — withdrawn
 
-The rq view showed every residual `md0` write arriving at the HDDs as
-write+flush barriers. If your NVMe drives are a DSM storage pool, DSM already
-created exactly-sized unused system partitions on them. The migration is
-mdadm RAID1 member management, automated idempotently by `fix sysmig` (one
-safe step per run, refuses while resyncing, re-run until done):
+DSM mirrors its OS (`md0` = `/`) and swap (`md1`) onto every data drive, so
+the root filesystem alone writes to the HDDs. The obvious move was to add the
+NVMe drives' unused system partitions to those arrays and strip the HDD
+members (`fix sysmig`, 2026-07-23). It ran for seven weeks and was withdrawn
+after a power outage on 2026-09-08 showed what DSM actually does at boot:
 
-add NVMe p1/p2 to md0/md1 → wait `[UUUU]` → fail+remove sata members →
-`--grow --raid-devices=2`.
+    /sbin/mdadm /dev/md1 -A -u <uuid> --run /dev/sata2p2
 
-**Discoveries that cost real time:**
+The system arrays are assembled from an explicit list of SATA-slot
+partitions, with `--run` forcing a degraded start. NVMe partitions are never
+offered. So the migration cannot persist across a boot, and worse: once the
+HDD members are stripped, everything DSM writes to `/` lives only on NVMe,
+and the next boot comes up on the HDD copy frozen at strip time — a rollback
+of the whole system partition at every reboot, tasks and settings included.
+Zeroing the HDD superblocks would not help; it leaves DSM with no system
+partition at all. The stock layout stays. See ADR 6.
 
-- DSM re-adds HDD system partitions **at every boot** (not just updates),
-  one or more drives at a time. The boot task re-strips them (~8GB resync
-  onto the HDDs per boot before the strip — the price of DSM's auto-repair).
-- Storage Manager showing **both** HDDs with "system partition failed" is
-  the *correct* state signature. One or zero warnings = DSM has re-adopted
-  a drive. Never click "Repair" — that is the undo button.
-- Drive names can re-enumerate across reboots (sata3/4 became sata1/2
-  here); decode old traces via the device table each recording stores in
-  its `meta`.
+What the migration was meant to buy was smaller than it looked: the
+standby log shows the drives reaching their idle timer regularly with the
+system partition on them. `md0` is a contributor, not the blocker, and the
+wake attribution names the real ones.
 
 ## Fix 2: the native idle timer — a documented dead end
 
@@ -291,11 +292,8 @@ Task Scheduler entry (Triggered / Boot-up / root):
 
     bash /path/to/hibdbg.sh boot
 
-which runs `fix shim on` → `fix sysmig` → `fix sleepd start` → `watch start`,
-all idempotent.
-Post-update ritual: `status` (shim/daemon/timer health) and `status map`
-(arrays `[2/2]` NVMe-only) — or just check that *both* HDDs still
-show the failed-system-partition warning.
+which runs `fix shim on` → `fix sleepd start` → `watch start`, all
+idempotent. Post-update ritual: `status` (shim/daemon/timer health).
 
 ## Verification
 
@@ -326,7 +324,7 @@ show the failed-system-partition warning.
     watch          wake-notify daemon: start/stop/status,
                    mode [digest|perwake], digest, test
     hib            idle timer: hib [min|undo]
-    fix            mitigations: shim on|off|status, sysmig,
+    fix            mitigations: shim on|off|status,
                    sleepd start|stop|status, quiesce/unquiesce,
                    calm [s|off], calm3 [s|off]
     dsm            DSM-side: debug on|off, log [n], sched, smb, nfs
@@ -336,7 +334,6 @@ show the failed-system-partition warning.
 
 | Change | Undo |
 |---|---|
-| System partition on NVMe (`fix sysmig`) | Storage Manager "Repair", or `mdadm --grow -n 4` + re-add sata members |
 | Poll shim (`fix shim on`) | `fix shim off` (restores original binary); any reboot also reverts it |
 | `sleepd` | `fix sleepd stop`; delete the boot task to stop re-asserting |
 | Idle timer (`hib MIN`) | `hib undo` |

@@ -1,5 +1,46 @@
 # Architecture decisions
 
+## ADR 6: the system partition stays on the HDDs; `fix sysmig` is removed
+
+2026-09-09
+
+### Context
+
+`fix sysmig` (2026-07-23) added the NVMe drives' system partitions to md0/md1
+and stripped the HDD members, so that DSM's root filesystem would stop
+writing to the drives meant to sleep. A power outage on 2026-09-08 exposed
+how DSM assembles those arrays at boot:
+
+    /sbin/mdadm /dev/md1 -A -u <uuid> --run /dev/sata2p2
+
+An explicit list of SATA-bay partitions, `--run` forcing a degraded start,
+NVMe partitions never offered. After the outage md0/md1 came up `[4/1]` on
+`sata2p1`/`sata2p2` alone; the NVMe members, carrying the newest copy, were
+simply not assembled. In this instance the root was still current because
+the migration had never completed: `boot` runs sysmig once, and sysmig needs
+a second run after the resync to strip the HDD members, which nobody made.
+
+### Decision
+
+The migration is withdrawn and its code deleted. md0/md1 keep DSM's stock
+layout, mirrored across the SATA bays.
+
+### Consequences
+
+- Had the migration completed, every boot would have rolled the system
+  partition back to the HDD copy frozen at strip time, discarding all DSM
+  state written since (tasks, settings, package registrations), and the
+  boot task would then have resynced the NVMe members from that stale copy.
+  A one-time migration on DSM is a rollback time bomb, not a mitigation.
+- Zeroing the stripped HDD superblocks is not a fix: it leaves DSM with no
+  assemblable system array and no path to the NVMe copy.
+- `md0` writes reach the HDDs again. The standby log shows the drives
+  reaching the idle timer regularly even so; the system partition is a
+  contributor, and `fix calm` batches its commits, but it is not the
+  blocker. Wake attribution names the actual writers.
+- The Storage Manager "system partition failed" warning is once more a real
+  fault, and DSM's Repair is once more the right answer to it.
+
 ## ADR 5: read wakes are named by page-cache misses and /proc, in that order
 
 2026-09-07

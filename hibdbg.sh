@@ -60,6 +60,34 @@ nfs_peers() {
 	fi
 }
 
+# /var/log relocation: DSM logs and its log DBs (synolog/*.db) are the
+# system partition's steady writers, i.e. the HDDs'. The backing dir lives
+# on the volume holding this script (an SSD volume by the README's rule).
+varlog_dir() { echo "$(stat -c %m "$RECBASE")/@varlog"; }
+varlog_stale() { # units holding files under /var/log on a device other
+	# than the current mount: opened before a bind/unbind, still writing
+	# to the old copy. Any systemd service qualifies, whatever its slice
+	# (packages get their own); containers have no .service and are skipped.
+	local want fd pid
+	want=$(stat -c %d /var/log)
+	find /proc/[0-9]*/fd -maxdepth 1 -lname '/var/log/*' 2>/dev/null \
+	| while read -r fd; do
+		[ "$(stat -Lc %d "$fd" 2>/dev/null)" != "$want" ] || continue
+		pid=${fd#/proc/}; pid=${pid%%/*}
+		sed -n 's|^.*\.slice/\([^/]*\)\.service$|\1|p' "/proc/$pid/cgroup" 2>/dev/null | head -1
+	done | sort -u
+}
+varlog_reopen() { # restart what still writes to the previous /var/log
+	# systemctl's exit code is not the truth here (DSM answers "Job ...
+	# invalid" for syslog-ng and restarts it anyway): re-check the handles.
+	local u units left
+	units=$(varlog_stale)
+	[ -n "$units" ] || { echo "no service holds files on the previous /var/log"; return 0; }
+	for u in $units; do systemctl restart "$u" 2>/dev/null; echo "restarted $u"; done
+	left=$(varlog_stale)
+	[ -z "$left" ] && echo "all log writers reopened" || echo "still on the previous /var/log: $left"
+}
+
 devnum() { # kernel dev_t of a block device node (maj<<20|min)
 	local maj min
 	IFS=: read -r maj min <<< "$(stat -Lc '%t:%T' "$1" 2>/dev/null)"
@@ -276,11 +304,13 @@ notify
 configure and mitigate
   hib [MIN|undo]               show or set the idle timer (minutes)
   fix shim on|off|status       cache scemd temp polls so standby holds
+  fix logs on|off|status       move /var/log (DSM's md0 writers) to the SSD
+  fix swap off|on|status       release md1 (swap on the HDDs)
   fix sleepd start|stop|status the standby daemon itself
   fix quiesce|unquiesce        disable / restore indexing daemons
   fix calm [sec|off]           batch system-partition (md0) writes
   fix calm3 [sec|off]          batch volume3 btrfs commits
-  boot                         re-assert shim+sleepd+watch (boot task)
+  boot                         re-assert shim+logs+swap+quiesce+sleepd+watch
 
 inspect DSM
   status map                   device topology (dm, md, partitions)
@@ -476,7 +506,25 @@ usage: hibdbg fix <sub>
      Stop + disable indexing daemons and purge stale index/drive queues;
      unquiesce restores them.
 
-  calm [sec|off]     batch md0 journal+writeback (remount commit, def 600s)
+  logs on|off|status
+     Bind /var/log onto the SSD volume holding this script (<vol>/@varlog).
+     DSM's logs and its log databases (synolog/.SYNODISKDB, .SYNOCONNDB,
+     .SYNOACCOUNTDB; auth.log; messages) are the system partition's steady
+     writers, and md0 is mirrored on every HDD: each write is a spin-up.
+     "on" seeds the directory once, binds it, and restarts the services
+     still holding files on the md0 copy (listed as it goes); "off" reverses
+     it, keeping the copy. Without the bind DSM logs to md0 as stock -- the
+     mitigation degrades, nothing rolls back.
+
+  swap off|on|status
+     md1 (swap) is mirrored on the HDDs like md0; any paging spins them up.
+     off releases it. Nothing on the SSD volume can stand in: btrfs
+     swapfiles need kernel >= 5.0 and DSM runs 4.4. Check free -m first.
+
+  calm [sec|off]     batch md0 journal+writeback (remount commit, def 600s).
+                     Not in boot: sqlite fsyncs bypass it, and up to SEC
+                     seconds of unsynced system-partition metadata die with
+                     the power. Use for experiments only.
   calm3 [sec|off]    batch volume3 btrfs commits (def 600s); up to SEC seconds
                      of buffered writes lost on power failure. off = defaults.
 EOF
@@ -497,13 +545,13 @@ EOF
 	boot) cat <<'EOF'
 usage: hibdbg boot
 
-Re-asserts the whole stack, idempotently: fix shim on, fix sleepd start,
-watch start.
+Re-asserts the whole stack, idempotently: fix shim on, fix logs on,
+fix swap off, fix quiesce, fix sleepd start, watch start.
 
-DSM restores the stock wrapper binary at every boot, not just across updates,
-and /run (the daemons' pidfiles) is cleared. Register this as a Task Scheduler
-triggered task (Boot-up, user root) or the stack silently degrades after any
-reboot.
+Every boot -- and every DSM update -- restores the stock wrapper binary,
+/var/log and swap on the HDD-mirrored system arrays, and the indexing
+package, and clears /run (the daemons' pidfiles). Register this as a Task Scheduler triggered task
+(Boot-up, user root) or the stack silently degrades after any reboot.
 EOF
 	;;
 	*)	die "unknown command: $1 (hibdbg --help for the list)" ;;
@@ -535,6 +583,9 @@ status)	case "${2:-}" in
 			&& echo "pollshim: installed" || echo "pollshim: NOT installed (stock sg_raw)"
 		pid=$(alive "$SPID" _sleepd) \
 			&& echo "sleepd:   running (pid $pid)" || echo "sleepd:   NOT running"
+		grep -q ' /var/log ' /proc/mounts \
+			&& echo "varlog:   on SSD ($(varlog_dir))" || echo "varlog:   on md0 (HDDs)"
+		grep -q '^/dev/md1 ' /proc/swaps && echo "swap:     on md1 (HDDs)" || echo "swap:     off"
 		printf 'dsm debug: '
 		[ "$(synogetkeyvalue /etc/synoinfo.conf enable_hibernation_debug 2>/dev/null)" = yes ] \
 			&& echo "on (arms block_dump; dsm debug off)" || echo "off"
@@ -1092,6 +1143,48 @@ fix)	case "${2:-}" in
 			systemctl start "$u" 2>/dev/null || true
 		done
 		echo "indexing restored" ;;
+	logs)	# bind /var/log onto the SSD volume: the log files and log DBs
+		# DSM writes there are what keeps the system partition -- and so
+		# every HDD -- busy. Reversible; absent the bind (boot task
+		# missed) DSM logs to md0 as stock, nothing rolls back.
+		dir=$(varlog_dir)
+		case "${3:-}" in
+		on)	if grep -q ' /var/log ' /proc/mounts; then
+				echo "already mounted: $(awk '$2=="/var/log"{print $1}' /proc/mounts)"
+			else
+				mkdir -p "$dir"
+				# seed once: the log daemons expect their DBs to exist
+				[ -n "$(ls -A "$dir")" ] || cp -a /var/log/. "$dir/"
+				mount --bind "$dir" /var/log
+				echo "/var/log -> $dir"
+			fi
+			varlog_reopen ;;
+		off)	grep -q ' /var/log ' /proc/mounts || { echo "not mounted"; exit 0; }
+			umount /var/log && echo "/var/log back on md0 (copy kept in $dir)"
+			varlog_reopen ;;
+		status)	if grep -q ' /var/log ' /proc/mounts; then
+				echo "on: /var/log -> $dir"
+			else
+				echo "off: /var/log on md0"
+			fi
+			stale=$(varlog_stale)
+			[ -z "$stale" ] || echo "still on the previous copy: $(echo "$stale" | tr '\n' ' ')" ;;
+		*)	die "usage: hibdbg fix logs on|off|status" ;;
+		esac ;;
+	swap)	# md1 (swap) is mirrored on the HDDs like md0: any paging is a
+		# spin-up. off = no swap at all; the SSD volume cannot replace it
+		# (btrfs swapfiles need kernel >= 5.0, DSM runs 4.4)
+		case "${3:-}" in
+		off)	if grep -q '^/dev/md1 ' /proc/swaps; then
+				swapoff /dev/md1 && echo "swap off (md1 released)"
+			else
+				echo "swap already off"
+			fi ;;
+		on)	swapon /dev/md1 && echo "swap on (md1)" ;;
+		status)	grep -q '^/dev/md1 ' /proc/swaps && echo "on: md1 (HDDs)" || echo "off"
+			free -m | awk 'NR==1 || /Mem|Swap/' ;;
+		*)	die "usage: hibdbg fix swap off|on|status" ;;
+		esac ;;
 	calm)	# batch md0 writes: remount commit=SEC (default 600) + relax dirty
 		# writeback so flushes coalesce. off = restore defaults
 		case "${3:-}" in
@@ -1104,8 +1197,7 @@ fix)	case "${2:-}" in
 			echo $((sec*100)) > /proc/sys/vm/dirty_expire_centisecs
 			echo 6000 > /proc/sys/vm/dirty_writeback_centisecs
 			echo "md0 journal commit=${sec}s, expire=${sec}s, writeback=60s"
-			echo "persist: Task Scheduler > Triggered > Boot-up > root:"
-			echo "  $(readlink -f "$0") fix calm $sec" ;;
+			echo 'persist across reboots: covered by the "hibdbg.sh boot" boot-up task' ;;
 		esac ;;
 	calm3)	# batch volume3 btrfs commits (def 600s). One flush burst per
 		# interval instead of every 30s; up to SEC seconds of buffered
@@ -1119,7 +1211,7 @@ fix)	case "${2:-}" in
 			echo "persist: Task Scheduler > Triggered > Boot-up > root:"
 			echo "  $(readlink -f "$0") fix calm3 $sec" ;;
 		esac ;;
-	*)	die "usage: hibdbg fix shim|sleepd|quiesce|unquiesce|calm|calm3 ..." ;;
+	*)	die "usage: hibdbg fix shim|logs|swap|sleepd|quiesce|unquiesce|calm|calm3 ..." ;;
 	esac ;;
 
 _sleepd) mkdir -p "$RUNDIR"; echo $$ > "$SPID"
@@ -1371,10 +1463,13 @@ dsm)	case "${2:-}" in
 	*)	die "usage: hibdbg dsm debug|log|sched|smb|nfs ..." ;;
 	esac ;;
 
-boot)	# idempotent boot task: DSM restores stock sg_raw at every boot and
-	# /run is cleared, so re-assert the shim and both daemons. Task
+boot)	# idempotent boot task: every boot restores stock sg_raw, /var/log and
+	# swap on md0/md1, and the indexing package, and clears /run. Task
 	# Scheduler: Triggered > Boot-up > root: /path/hibdbg.sh boot
 	"$0" fix shim on
+	"$0" fix logs on
+	"$0" fix swap off
+	"$0" fix quiesce
 	"$0" fix sleepd start
 	"$0" watch start ;;
 

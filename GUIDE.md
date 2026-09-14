@@ -193,6 +193,26 @@ standby log shows the drives reaching their idle timer regularly with the
 system partition on them. `md0` is a contributor, not the blocker, and the
 wake attribution names the real ones.
 
+## Fix 6: `/var/log` on the SSD (`fix logs on`)
+
+With every app-level writer scheduled or disabled, two-hour recordings still
+showed the same residual: `synostgd-disk` writing `.SYNODISKDB`, `synologaccd`
+writing `.SYNOACCOUNTDB`, connection logs, `auth.log`, `messages` — DSM
+writing its own logs and log databases to `/var/log`, on md0, mirrored to
+every HDD. One 4 KB sqlite WAL write ended a 24-minute standby. `fix calm`
+cannot batch these: sqlite `fsync`s its WAL, which forces the journal out
+regardless of the commit interval.
+
+`fix logs on` bind-mounts `/var/log` onto `<vol>/@varlog` on the SSD volume
+holding the script, seeds it once from the md0 copy, and restarts the
+services still holding files on the old copy (found generically: any
+service in any slice, packages included, with an fd under `/var/log` on the
+wrong device).
+Reversible with `fix logs off`; if the boot task misses, DSM simply logs to
+md0 as stock. The bind cannot happen before the volume is mounted, which is
+after syslog-ng starts — hence the restart step rather than a systemd
+ordering. See ADR 7.
+
 ## Fix 2: the native idle timer — a documented dead end
 
 The timer lives in `/etc/synoinfo.conf` (`standbytimer`, minutes;
@@ -292,8 +312,9 @@ Task Scheduler entry (Triggered / Boot-up / root):
 
     bash /path/to/hibdbg.sh boot
 
-which runs `fix shim on` → `fix sleepd start` → `watch start`, all
-idempotent. Post-update ritual: `status` (shim/daemon/timer health).
+which runs `fix shim on` → `fix logs on` → `fix swap off` → `fix quiesce` →
+`fix sleepd start` → `watch start`, all idempotent. Every reboot and every DSM update reverts
+all five. Post-update ritual: `status` (shim/daemon/timer health).
 
 ## Verification
 
@@ -324,7 +345,8 @@ idempotent. Post-update ritual: `status` (shim/daemon/timer health).
     watch          wake-notify daemon: start/stop/status,
                    mode [digest|perwake], digest, test
     hib            idle timer: hib [min|undo]
-    fix            mitigations: shim on|off|status,
+    fix            mitigations: shim on|off|status, logs on|off|status,
+                   swap off|on|status,
                    sleepd start|stop|status, quiesce/unquiesce,
                    calm [s|off], calm3 [s|off]
     dsm            DSM-side: debug on|off, log [n], sched, smb, nfs
@@ -334,6 +356,8 @@ idempotent. Post-update ritual: `status` (shim/daemon/timer health).
 
 | Change | Undo |
 |---|---|
+| `/var/log` on the SSD (`fix logs on`) | `fix logs off` (copy kept in `<vol>/@varlog`); any reboot also reverts it |
+| Swap released (`fix swap off`) | `fix swap on`; any reboot also reverts it |
 | Poll shim (`fix shim on`) | `fix shim off` (restores original binary); any reboot also reverts it |
 | `sleepd` | `fix sleepd stop`; delete the boot task to stop re-asserting |
 | Idle timer (`hib MIN`) | `hib undo` |

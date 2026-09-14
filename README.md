@@ -30,11 +30,12 @@ drives under test.
 Mitigation stack (see GUIDE.md for the reasoning):
 
     sudo ./hibdbg.sh fix shim on     # cache scemd SCT polls while asleep
+    sudo ./hibdbg.sh fix logs on     # /var/log (DSM's md0 writers) -> SSD
     sudo ./hibdbg.sh fix sleepd start # idle-timer standby daemon
-    sudo ./hibdbg.sh boot            # shim + both daemons, idempotent
+    sudo ./hibdbg.sh boot            # shim, logs, swap, quiesce, daemons
 
-DSM reverts the binary shim at every boot: register a Task Scheduler boot-up
-task (root) running `hibdbg.sh boot`.
+DSM reverts all of it at every boot and update: register a Task Scheduler
+boot-up task (root) running `hibdbg.sh boot`.
 
 ## Docs
 

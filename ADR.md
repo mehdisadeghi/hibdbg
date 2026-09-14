@@ -1,5 +1,63 @@
 # Architecture decisions
 
+## ADR 8: `calm` leaves the boot task; swap is released
+
+2026-09-14
+
+`fix calm` (ext4 `commit=600` on `/`) was meant to coalesce the system
+partition's writes. ADR 7's recordings showed its limit and its cost: the
+writers that actually ended standby were sqlite WALs, which fsync and so
+commit the journal regardless of the interval, while a 600 s window
+collided exactly with a 10-minute idle timer and turned every flush into a
+clock reset. Meanwhile up to ten minutes of unsynced metadata on the system
+partition would die with the power, which this box has now lost once. With
+`/var/log` off md0 the remaining benefit is nil; `calm` stays as an
+experiment knob and is no longer re-asserted.
+
+`md1` (swap) is mirrored on the HDDs like `md0`, so any paging is a
+spin-up. `boot` now releases it. No SSD-backed replacement exists on this
+kernel: btrfs swapfiles need 5.0+, DSM ships 4.4; a swap partition on the
+NVMe would mean creating an array DSM does not know about. The box runs
+without swap; `free -m` decides whether that holds.
+
+## ADR 7: DSM's logs move to the SSD; the system partition stays put
+
+2026-09-14
+
+### Context
+
+ADR 6 left md0 on the HDDs. Two-hour recordings with every application
+writer scheduled away still never reached the idle timer in normal
+operation, and the one standby that did occur (24 min) was ended by
+`synostgd-disk` writing `.SYNODISKDB-wal`. Every residual writer lived under
+`/var/log`: DSM's log files and the sqlite databases behind Log Center and
+Storage Manager. `fix calm` does not reach them -- sqlite fsyncs its WAL,
+which commits the journal regardless of `commit=`. The recording instruments
+had hidden this: block_dump-based commands pause syslog-ng, so the
+measurements were quieter than the box.
+
+### Decision
+
+`fix logs on` bind-mounts `/var/log` onto `<vol>/@varlog` on the SSD volume
+that holds the script, seeded once from the md0 copy, and restarts the
+services found still holding files on the old copy. `boot` re-asserts it.
+
+### Consequences
+
+- Nothing on md0 is relocated or rewritten, so there is no boot-time
+  dependency and no rollback mode: without the bind DSM logs to md0 as
+  stock and the mitigation merely lapses. This is the property ADR 6's
+  migration lacked.
+- Logs live on the SSD volume. Log Center, logrotate and the DSM UI see the
+  same paths; nothing is configured, only mounted.
+- The bind can only follow volume mount, which follows syslog-ng start, so
+  services that opened files before it must be restarted -- detected by
+  device number, not by a hard-coded list. At boot nothing is in use yet;
+  by hand it is a visible restart of the listed services.
+- `who`, `rec` and `sleepnow` still pause syslog-ng. With `/var/log` off
+  the HDDs that pause no longer changes what the HDDs see, but it still
+  hides syslog-ng from the writer lists.
+
 ## ADR 6: the system partition stays on the HDDs; `fix sysmig` is removed
 
 2026-09-09

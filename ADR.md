@@ -1,5 +1,44 @@
 # Architecture decisions
 
+## ADR 10: system-partition reads move to SSD mirrors; the HDD members stay
+
+2026-09-18
+
+### Context
+
+After ADR 9 md0 was write-quiet, yet using the box still woke the drives:
+DSM page loads and cold binaries are page-cache misses on `/`, and RAID1
+serves each from one member (sata1: 64k reads since boot, sata2: 17k, same
+writes). ADR 6 forbids the obvious move — DSM assembles md0 from the SATA
+bays only, so the HDD copy must stay current — but it says nothing against
+additional members.
+
+### Decision
+
+`fix mirror on` adds SSD partitions matching the HDD members' partition
+number and size (discovered, not named: non-rotational, unmounted, unheld)
+to md0's free slots and sets `writemostly` on the HDD members. A leftover
+superblock on a candidate is zeroed first: the partition is verified unused
+and about to be overwritten whole, and `--add` on a stale ex-member is
+otherwise ambiguous. `boot` re-asserts it, and its failure does not stop
+the rest of the boot task.
+
+### Consequences
+
+- No rollback mode exists: every write reaches the HDD members, so the
+  copy DSM boots is current whether or not the SSD members are present.
+  This is the property ADR 6's migration lacked.
+- DSM drops the SSD members at every boot; re-adding is a full recovery,
+  because md0 has no write-intent bitmap, and adding one would mean more
+  HDD writes. A minute or two of HDD reads per boot.
+- Writes still wake the drives. `/etc` and `/usr/syno/etc` are read at
+  boot before any volume is mounted, so they cannot be bound away like the
+  logs. Taking writes off the HDDs needs a member DSM itself assembles: a
+  SATA SSD in a bay. Then, and only then, dropping the HDD members is safe.
+- The SSD members occupy the slots DSM uses when a drive is inserted into
+  an empty bay: `fix mirror off` first.
+- md1 (swap) is left alone: it is released, not read.
+
 ## ADR 9: residual md0 writers are traced on the root device, then bound away
 
 2026-09-18

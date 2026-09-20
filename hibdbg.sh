@@ -105,6 +105,38 @@ holders() { # holders PATH -> "  pid unit cmd" per process with PATH open or
 }
 rootdev() { awk '$2=="/"{print $1; exit}' /proc/mounts; }
 
+# read mirror: RAID1 serves each read from one member, so every page-cache
+# miss on / (a DSM page load, a cold binary) spins up an HDD. SSD members
+# plus write-mostly HDD members move the reads; the HDDs still take every
+# write, so the copy DSM assembles at boot is always current.
+is_rot() { [ "$(cat "$(dirname "$(readlink -f "/sys/class/block/$1")")/queue/rotational" 2>/dev/null)" = 1 ]; }
+md_members() { ls "/sys/block/$1/slaves"; }
+mirror_parts() { # mirror_parts MD -> SSD partitions shaped like MD's HDD members
+	# (same partition number and size), mounted nowhere, held by nothing
+	# but MD itself
+	local md=$1 ref="" m num size p h
+	for m in $(md_members "$md"); do is_rot "$m" && { ref=$m; break; }; done
+	[ -n "$ref" ] || return 0
+	num=$(cat "/sys/class/block/$ref/partition"); size=$(cat "/sys/class/block/$ref/size")
+	for p in /sys/class/block/*; do
+		p=${p##*/}
+		[ "$(cat "/sys/class/block/$p/partition" 2>/dev/null)" = "$num" ] || continue
+		[ "$(cat "/sys/class/block/$p/size")" = "$size" ] || continue
+		! is_rot "$p" || continue
+		! grep -q "^/dev/$p " /proc/mounts || continue
+		h=$(ls "/sys/class/block/$p/holders")
+		[ -z "$h" ] || [ "$h" = "$md" ] || continue
+		echo "$p"
+	done
+}
+mirror_status() { # one line per member: name kind state
+	local md=$1 m
+	for m in $(md_members "$md"); do
+		echo "  $m $(is_rot "$m" && echo hdd || echo ssd) $(cat "/sys/block/$md/md/dev-$m/state")"
+	done
+	echo "  sync: $(cat "/sys/block/$md/md/sync_action") $(grep -A3 "^$md " /proc/mdstat | grep -oE '(recovery|resync) = [0-9.]+%' || true)"
+}
+
 devnum() { # kernel dev_t of a block device node (maj<<20|min)
 	local maj min
 	IFS=: read -r maj min <<< "$(stat -Lc '%t:%T' "$1" 2>/dev/null)"
@@ -324,11 +356,12 @@ configure and mitigate
   fix shim on|off|status       cache scemd temp polls so standby holds
   fix logs on|off|status       move DSM's md0 log stores to the SSD
   fix swap off|on|status       release md1 (swap on the HDDs)
+  fix mirror on|off|status     serve system-partition reads from the SSDs
   fix sleepd start|stop|status the standby daemon itself
   fix quiesce|unquiesce        disable / restore indexing daemons
   fix calm [sec|off]           batch system-partition (md0) writes
   fix calm3 [sec|off]          batch volume3 btrfs commits
-  boot                         re-assert shim+logs+swap+quiesce+sleepd+watch
+  boot                         re-assert shim+logs+swap+mirror+quiesce+sleepd+watch
 
 inspect DSM
   status map                   device topology (dm, md, partitions)
@@ -543,6 +576,18 @@ usage: hibdbg fix <sub>
      degrades, nothing rolls back. "status" lists every stale handle.
      "who sys" is how a new store gets found; add it to LOGDIRS.
 
+  mirror on|off|status
+     RAID1 serves each read from one member, so any page-cache miss on /
+     (a DSM page load, a cold binary) spins up an HDD. "on" adds the SSD
+     partitions shaped like the root array's HDD members (same number and
+     size, unused) as extra mirrors and flags the HDD members write-mostly:
+     reads come from the SSDs, every write still reaches the HDDs. Nothing
+     is removed, so the copy DSM assembles at boot -- SATA bays only -- is
+     always current; a missed boot task costs the mitigation, not data.
+     DSM drops the SSD members at every boot; "on" re-adds them with a
+     full recovery (a minute or two of HDD reads). They occupy the array's
+     free slots: run "off" before inserting a drive into an empty bay.
+
   swap off|on|status
      md1 (swap) is mirrored on the HDDs like md0; any paging spins them up.
      off releases it. Nothing on the SSD volume can stand in: btrfs
@@ -613,6 +658,9 @@ status)	case "${2:-}" in
 		off=$(for d in $LOGDIRS; do logs_mounted "$d" || echo "$d"; done)
 		[ -z "$off" ] && echo "logs:     on SSD ($LOGDIRS)" || echo "logs:     on md0 (HDDs): $off"
 		grep -q '^/dev/md1 ' /proc/swaps && echo "swap:     on md1 (HDDs)" || echo "swap:     off"
+		md=$(basename "$(rootdev)")
+		ssd=$(for m in $(md_members "$md"); do is_rot "$m" || echo "$m"; done | tr '\n' ' ')
+		[ -n "$ssd" ] && echo "mirror:   $md reads on SSD (${ssd% })" || echo "mirror:   off ($md reads hit the HDDs)"
 		printf 'dsm debug: '
 		[ "$(synogetkeyvalue /etc/synoinfo.conf enable_hibernation_debug 2>/dev/null)" = yes ] \
 			&& echo "on (arms block_dump; dsm debug off)" || echo "off"
@@ -1261,6 +1309,46 @@ fix)	case "${2:-}" in
 			free -m | awk 'NR==1 || /Mem|Swap/' ;;
 		*)	die "usage: hibdbg fix swap off|on|status" ;;
 		esac ;;
+	mirror)	# serve the system partition's reads from the SSDs: add the SSD
+		# system partitions to the root array as extra mirrors and flag
+		# the HDD members write-mostly. Nothing is removed: the HDDs take
+		# every write and stay the copy DSM boots from, so a missed boot
+		# task costs the mitigation, never data (contrast ADR 6).
+		md=$(basename "$(rootdev)")
+		[ -d "/sys/block/$md/md" ] || die "/ is not on an md array ($md)"
+		case "${3:-}" in
+		on)	free=$(( $(cat "/sys/block/$md/md/raid_disks") - $(md_members "$md" | wc -l) ))
+			for p in $(mirror_parts "$md"); do
+				if [ -e "/sys/block/$md/md/dev-$p" ]; then
+					echo "$p: already a member"
+				elif [ "$free" -gt 0 ]; then
+					# the partition is verified unused and is about to be
+					# overwritten whole; a leftover superblock from an
+					# earlier membership would make --add ambiguous
+					mdadm --zero-superblock "/dev/$p" 2>/dev/null || true
+					mdadm "/dev/$md" --add "/dev/$p" && echo "$p: added, recovery starts"
+					free=$((free-1))
+				else
+					echo "$p: no free slot in $md, skipped"
+				fi
+			done
+			ssd=$(for m in $(md_members "$md"); do is_rot "$m" || echo "$m"; done)
+			[ -n "$ssd" ] || die "$md has no SSD member and none could be added"
+			for m in $(md_members "$md"); do
+				! is_rot "$m" || echo writemostly > "/sys/block/$md/md/dev-$m/state"
+			done
+			mirror_status "$md" ;;
+		off)	for m in $(md_members "$md"); do
+				if is_rot "$m"; then
+					printf '%s\n' -writemostly > "/sys/block/$md/md/dev-$m/state"
+				else
+					mdadm "/dev/$md" --fail "/dev/$m" --remove "/dev/$m" && echo "$m: removed"
+				fi
+			done
+			mirror_status "$md" ;;
+		status)	mirror_status "$md" ;;
+		*)	die "usage: hibdbg fix mirror on|off|status" ;;
+		esac ;;
 	calm)	# batch md0 writes: remount commit=SEC (default 600) + relax dirty
 		# writeback so flushes coalesce. off = restore defaults
 		case "${3:-}" in
@@ -1287,7 +1375,7 @@ fix)	case "${2:-}" in
 			echo "persist: Task Scheduler > Triggered > Boot-up > root:"
 			echo "  $(readlink -f "$0") fix calm3 $sec" ;;
 		esac ;;
-	*)	die "usage: hibdbg fix shim|logs|swap|sleepd|quiesce|unquiesce|calm|calm3 ..." ;;
+	*)	die "usage: hibdbg fix shim|logs|swap|mirror|sleepd|quiesce|unquiesce|calm|calm3 ..." ;;
 	esac ;;
 
 _sleepd) mkdir -p "$RUNDIR"; echo $$ > "$SPID"
@@ -1540,11 +1628,14 @@ dsm)	case "${2:-}" in
 	esac ;;
 
 boot)	# idempotent boot task: every boot restores stock sg_raw, /var/log and
-	# swap on md0/md1, and the indexing package, and clears /run. Task
-	# Scheduler: Triggered > Boot-up > root: /path/hibdbg.sh boot
+	# swap on md0/md1, the SATA-only system array, and the indexing
+	# package, and clears /run. Task Scheduler: Triggered > Boot-up > root:
+	# /path/hibdbg.sh boot. The mirror is optional hardware-wise (no SSD
+	# partition, no mirror): its failure must not cost sleepd and watch.
 	"$0" fix shim on
 	"$0" fix logs on
 	"$0" fix swap off
+	"$0" fix mirror on || echo "mirror: not applied"
 	"$0" fix quiesce
 	"$0" fix sleepd start
 	"$0" watch start ;;

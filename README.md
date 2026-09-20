@@ -31,8 +31,9 @@ Mitigation stack (see GUIDE.md for the reasoning):
 
     sudo ./hibdbg.sh fix shim on     # cache scemd SCT polls while asleep
     sudo ./hibdbg.sh fix logs on     # DSM's md0 log stores -> SSD
+    sudo ./hibdbg.sh fix mirror on   # system-partition reads -> SSD mirrors
     sudo ./hibdbg.sh fix sleepd start # idle-timer standby daemon
-    sudo ./hibdbg.sh boot            # shim, logs, swap, quiesce, daemons
+    sudo ./hibdbg.sh boot            # shim, logs, swap, mirror, quiesce, daemons
 
 DSM reverts all of it at every boot and update: register a Task Scheduler
 boot-up task (root) running `hibdbg.sh boot`.

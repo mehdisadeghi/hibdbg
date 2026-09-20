@@ -227,6 +227,35 @@ passes no write syscall, so only writeback shows it, as `kworker` on the
 inode. Any future residual goes the same way: `who sys`, then the directory
 joins `LOGDIRS`. See ADR 9.
 
+## Fix 7: system-partition reads from the SSDs (`fix mirror on`)
+
+With the log stores moved, md0 took no writes for ten-minute windows, and
+the drives still woke on use: opening DSM, a cold binary, any page-cache
+miss on `/`. RAID1 serves each read from a single member, and md prefers the
+first: since boot sata1 had served 64k reads to sata2's 17k, with identical
+writes — which is also why one drive reached standby and the other did not.
+
+`fix mirror on` adds the SSD partitions shaped like md0's HDD members (same
+partition number and size, mounted nowhere, held by nothing — on this box
+the NVMe drives' own DSM-style system partitions) as extra mirrors in the
+array's free slots, and flags the HDD members write-mostly. md then reads
+from the SSDs and writes to everyone.
+
+This is not Fix 1 again. Fix 1 removed the HDD members, which left DSM — it
+assembles md0 from the SATA bays only — booting a stale copy. Here nothing
+is removed: the HDDs receive every write, so the copy DSM assembles is
+always current. DSM drops the SSD members at every boot and `boot` re-adds
+them with a full recovery (8 GB, a minute or two of HDD reads). A missed
+boot task costs the mitigation, never data. The SSD members fill the free
+slots DSM would use for a new drive: `fix mirror off` before inserting one.
+
+What it does not fix: writes. Changing a setting writes `/etc` or
+`/usr/syno/etc` on md0 and wakes the drives, and must — those directories
+are authoritative at boot, before any bind could exist, so they cannot go
+the way of the logs. The only clean way to take writes off the HDDs is a
+SATA SSD in a free bay: DSM makes it a real md0 member, assembled at boot,
+after which the HDD members can be dropped safely. See ADR 10.
+
 ## Fix 2: the native idle timer — a documented dead end
 
 The timer lives in `/etc/synoinfo.conf` (`standbytimer`, minutes;
@@ -326,7 +355,7 @@ Task Scheduler entry (Triggered / Boot-up / root):
 
     bash /path/to/hibdbg.sh boot
 
-which runs `fix shim on` → `fix logs on` → `fix swap off` → `fix quiesce` →
+which runs `fix shim on` → `fix logs on` → `fix swap off` → `fix mirror on` → `fix quiesce` →
 `fix sleepd start` → `watch start`, all idempotent. Every reboot and every DSM update reverts
 all five. Post-update ritual: `status` (shim/daemon/timer health).
 
@@ -361,7 +390,7 @@ all five. Post-update ritual: `status` (shim/daemon/timer health).
                    mode [digest|perwake], digest, test
     hib            idle timer: hib [min|undo]
     fix            mitigations: shim on|off|status, logs on|off|status,
-                   swap off|on|status,
+                   swap off|on|status, mirror on|off|status,
                    sleepd start|stop|status, quiesce/unquiesce,
                    calm [s|off], calm3 [s|off]
     dsm            DSM-side: debug on|off, log [n], sched, smb, nfs
@@ -373,6 +402,7 @@ all five. Post-update ritual: `status` (shim/daemon/timer health).
 |---|---|
 | Log stores on the SSD (`fix logs on`) | `fix logs off` (copies kept in `<vol>/@var-log`, `<vol>/@var-lib-diskutil`); any reboot also reverts it |
 | Swap released (`fix swap off`) | `fix swap on`; any reboot also reverts it |
+| SSD read mirrors on md0 (`fix mirror on`) | `fix mirror off` (removes the SSD members, clears write-mostly); any reboot also drops the SSD members |
 | Poll shim (`fix shim on`) | `fix shim off` (restores original binary); any reboot also reverts it |
 | `sleepd` | `fix sleepd stop`; delete the boot task to stop re-asserting |
 | Idle timer (`hib MIN`) | `hib undo` |

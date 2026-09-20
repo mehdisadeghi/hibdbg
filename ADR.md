@@ -1,5 +1,56 @@
 # Architecture decisions
 
+## ADR 9: residual md0 writers are traced on the root device, then bound away
+
+2026-09-18
+
+### Context
+
+ADR 7 moved `/var/log` and the drives still never reached the timer. `status
+live` showed ~20 md0 writes per 10 minutes; block-level tracing showed only
+`jbd2` commits; ext4 write and fsync tracepoints showed nothing at all. Two
+instrument failures had to be understood before the writer could be named:
+
+- The main ftrace ring holds ~15k lines. Unfiltered, the NVMe volumes' page
+  dirtying overruns it within a minute and md0's handful of events are gone
+  before the window ends — an empty grep that looks like a quiet disk.
+- sqlite touches its wal-index (`-shm`) through mmap. That is a page
+  dirtied with no write syscall, no `ext4_da_write_begin`, no fsync, and no
+  `writeback_dirty_inode` (which fires for I_DIRTY_SYNC only). It surfaces
+  solely at writeback, as `kworker` on the inode.
+
+With the filter applied in the kernel (`dev == <root dev_t>` on the ext4,
+jbd2 and `block_bio_queue` events) and a probe write to prove the tracer
+sees the device, one window named inode 398745: Log Center's
+`/var/lib/diskutil/diskutil.conn-shm`, mapped by its syslog-ng, outside
+`/var/log`. The same window also showed that ADR 7's restart step had
+matched `system.slice` units only, leaving the system syslog-ng, Log
+Center's syslog-ng, nginx, smbd, nmbd and rsyncd on the md0 copy.
+
+### Decision
+
+`who sys` is the instrument: root-device-filtered ext4/jbd2/bio tracing
+with a probe self-check, inode → path via debugfs, path → holders via open
+fds and `/proc/*/maps`. `fix logs` binds a list of log stores (`LOGDIRS`),
+each onto `<vol>/@<path-with-dashes>`, and its restart step matches a
+service in any slice and verifies by re-checking handles rather than
+trusting systemctl's exit code. A residual found by `who sys` joins the
+list; nothing is guessed.
+
+### Consequences
+
+- The backing directory for `/var/log` is now `<vol>/@var-log`, uniform
+  with the rest; the earlier `@varlog` is renamed once by hand, not
+  special-cased.
+- `who sys` is blind to what it is not asked about: only the root device,
+  only while awake (it is a main-ring instrument like `who rq`, not a
+  daemon). It can also be blind to a writer that dirties and flushes
+  outside its window; run it long enough to cover the cadence `status live`
+  shows.
+- Every probe handed out during a live session becomes a verb in the same
+  change (HANDOFF's original rule, restated): the script is the record of
+  how the box was diagnosed.
+
 ## ADR 8: `calm` leaves the boot task; swap is released
 
 2026-09-14

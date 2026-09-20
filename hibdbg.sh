@@ -60,33 +60,50 @@ nfs_peers() {
 	fi
 }
 
-# /var/log relocation: DSM logs and its log DBs (synolog/*.db) are the
-# system partition's steady writers, i.e. the HDDs'. The backing dir lives
-# on the volume holding this script (an SSD volume by the README's rule).
-varlog_dir() { echo "$(stat -c %m "$RECBASE")/@varlog"; }
-varlog_stale() { # units holding files under /var/log on a device other
-	# than the current mount: opened before a bind/unbind, still writing
-	# to the old copy. Any systemd service qualifies, whatever its slice
-	# (packages get their own); containers have no .service and are skipped.
-	local want fd pid
-	want=$(stat -c %d /var/log)
-	find /proc/[0-9]*/fd -maxdepth 1 -lname '/var/log/*' 2>/dev/null \
-	| while read -r fd; do
-		[ "$(stat -Lc %d "$fd" 2>/dev/null)" != "$want" ] || continue
-		pid=${fd#/proc/}; pid=${pid%%/*}
-		sed -n 's|^.*\.slice/\([^/]*\)\.service$|\1|p' "/proc/$pid/cgroup" 2>/dev/null | head -1
+# md0 log stores: DSM's logs and log DBs under /var/log, and Log Center's
+# connection-log sqlite under /var/lib/diskutil, whose mmap'd wal-index is
+# flushed to md0 about once a minute (who sys named it). Each binds onto its
+# own dir on the volume holding this script (an SSD volume by the README's
+# rule): /var/log -> <vol>/@var-log.
+LOGDIRS="/var/log /var/lib/diskutil"
+logs_dir() { echo "$(stat -c %m "$RECBASE")/@$(echo "${1#/}" | tr / -)"; }
+logs_mounted() { grep -q " $1 " /proc/mounts; }
+unit_of() { # systemd service of a pid, in any slice (packages have their own)
+	sed -n 's|^.*\.slice/\([^/]*\)\.service$|\1|p' "/proc/$1/cgroup" 2>/dev/null | head -1
+}
+logs_stale() { # "pid unit path" per open file under a log dir on a device
+	# other than the current mount: opened before a bind/unbind, still
+	# writing the old copy. Containers have no .service and print no unit.
+	local d want fd pid
+	for d in $LOGDIRS; do
+		want=$(stat -c %d "$d")
+		find /proc/[0-9]*/fd -maxdepth 1 -lname "$d/*" 2>/dev/null \
+		| while read -r fd; do
+			[ "$(stat -Lc %d "$fd" 2>/dev/null)" != "$want" ] || continue
+			pid=${fd#/proc/}; pid=${pid%%/*}
+			echo "$pid $(unit_of "$pid") $(readlink "$fd")"
+		done
 	done | sort -u
 }
-varlog_reopen() { # restart what still writes to the previous /var/log
-	# systemctl's exit code is not the truth here (DSM answers "Job ...
-	# invalid" for syslog-ng and restarts it anyway): re-check the handles.
+logs_reopen() { # restart what still writes the previous copies. systemctl's
+	# exit code is not the truth here (DSM answers "Job ... invalid" for
+	# syslog-ng and restarts it anyway): the handles are re-checked instead.
 	local u units left
-	units=$(varlog_stale)
-	[ -n "$units" ] || { echo "no service holds files on the previous /var/log"; return 0; }
+	units=$(logs_stale | awk '$2!=""{print $2}' | sort -u)
+	[ -n "$units" ] || { echo "no service holds files on the previous copies"; return 0; }
 	for u in $units; do systemctl restart "$u" 2>/dev/null; echo "restarted $u"; done
-	left=$(varlog_stale)
-	[ -z "$left" ] && echo "all log writers reopened" || echo "still on the previous /var/log: $left"
+	left=$(logs_stale)
+	[ -z "$left" ] && echo "all log writers reopened" || printf 'still on the previous copy:\n%s\n' "$left"
 }
+holders() { # holders PATH -> "  pid unit cmd" per process with PATH open or
+	# mapped. mmap is how sqlite touches its wal-index: no fd write, no
+	# write syscall, only a page flushed later by kworker.
+	local f=$1 p
+	{ find /proc/[0-9]*/fd -maxdepth 1 -lname "$f" 2>/dev/null | cut -d/ -f3
+	  grep -lsF -- "$f" /proc/[0-9]*/maps 2>/dev/null | cut -d/ -f3; } | sort -un \
+	| while read -r p; do echo "  $p $(unit_of "$p") $(whois "$p")"; done
+}
+rootdev() { awk '$2=="/"{print $1; exit}' /proc/mounts; }
 
 devnum() { # kernel dev_t of a block device node (maj<<20|min)
 	local maj min
@@ -284,6 +301,7 @@ sample (seconds to minutes)
   who rq [sec]                 every sata command, incl. ATA passthrough
   who forks [sec] [comm]       which daemon spawns a short-lived helper
   who fresh [min] [path]       files modified in the last MIN minutes
+  who sys [sec]                what still writes the system partition (md0)
 
 record (hours, detached)
   rec [sec]                    start recorder (default 4h; survives logout)
@@ -304,7 +322,7 @@ notify
 configure and mitigate
   hib [MIN|undo]               show or set the idle timer (minutes)
   fix shim on|off|status       cache scemd temp polls so standby holds
-  fix logs on|off|status       move /var/log (DSM's md0 writers) to the SSD
+  fix logs on|off|status       move DSM's md0 log stores to the SSD
   fix swap off|on|status       release md1 (swap on the HDDs)
   fix sleepd start|stop|status the standby daemon itself
   fix quiesce|unquiesce        disable / restore indexing daemons
@@ -364,6 +382,12 @@ partition). block_dump cannot see SG_IO/ATA passthrough -- use who rq.
                       (def 30s, sg_raw)
   fresh [min] [path]  files modified in last MIN minutes, tracer-free mtime
                       walk; generates reads itself (def 10, /volume3)
+  sys [sec]           what still writes the system partition (md0): ext4,
+                      jbd2 and bio events on the root device, kernel-filtered
+                      so the volumes cannot flood the ring; self-checks with a
+                      probe write. Names inode -> path (debugfs) and who holds
+                      each file open or mmap'd -- the only way to see sqlite
+                      wal-index flushes, which pass no write syscall (def 300)
 EOF
 	;;
 	rec) cat <<'EOF'
@@ -507,14 +531,17 @@ usage: hibdbg fix <sub>
      unquiesce restores them.
 
   logs on|off|status
-     Bind /var/log onto the SSD volume holding this script (<vol>/@varlog).
+     Bind DSM's md0 log stores onto the SSD volume holding this script:
+     /var/log -> <vol>/@var-log, /var/lib/diskutil -> <vol>/@var-lib-diskutil.
      DSM's logs and its log databases (synolog/.SYNODISKDB, .SYNOCONNDB,
-     .SYNOACCOUNTDB; auth.log; messages) are the system partition's steady
-     writers, and md0 is mirrored on every HDD: each write is a spin-up.
-     "on" seeds the directory once, binds it, and restarts the services
-     still holding files on the md0 copy (listed as it goes); "off" reverses
-     it, keeping the copy. Without the bind DSM logs to md0 as stock -- the
-     mitigation degrades, nothing rolls back.
+     .SYNOACCOUNTDB; auth.log; messages; Log Center's diskutil.conn) are the
+     system partition's steady writers, and md0 is mirrored on every HDD:
+     each write is a spin-up. "on" seeds each directory once, binds it, and
+     restarts the services still holding files on the md0 copy, in any
+     slice (Log Center's syslog-ng, nginx, smbd); "off" reverses it, keeping
+     the copies. Without the bind DSM logs to md0 as stock -- the mitigation
+     degrades, nothing rolls back. "status" lists every stale handle.
+     "who sys" is how a new store gets found; add it to LOGDIRS.
 
   swap off|on|status
      md1 (swap) is mirrored on the HDDs like md0; any paging spins them up.
@@ -583,8 +610,8 @@ status)	case "${2:-}" in
 			&& echo "pollshim: installed" || echo "pollshim: NOT installed (stock sg_raw)"
 		pid=$(alive "$SPID" _sleepd) \
 			&& echo "sleepd:   running (pid $pid)" || echo "sleepd:   NOT running"
-		grep -q ' /var/log ' /proc/mounts \
-			&& echo "varlog:   on SSD ($(varlog_dir))" || echo "varlog:   on md0 (HDDs)"
+		off=$(for d in $LOGDIRS; do logs_mounted "$d" || echo "$d"; done)
+		[ -z "$off" ] && echo "logs:     on SSD ($LOGDIRS)" || echo "logs:     on md0 (HDDs): $off"
 		grep -q '^/dev/md1 ' /proc/swaps && echo "swap:     on md1 (HDDs)" || echo "swap:     off"
 		printf 'dsm debug: '
 		[ "$(synogetkeyvalue /etc/synoinfo.conf enable_hibernation_debug 2>/dev/null)" = yes ] \
@@ -723,6 +750,55 @@ who)	case "${2:-}" in
 		[ -s /tmp/hibrq.$$ ] || echo "(no requests)"
 		rm -f /tmp/hibrq.$$
 		echo 0 > "$T/events/block/block_rq_issue/filter" ;;
+	sys)	# what still writes the system partition: every ext4/jbd2 event
+		# and every bio on the root device for SEC seconds, filtered in the
+		# kernel (unfiltered, the volumes overrun the ring buffer within a
+		# minute and md0's few events are lost). A probe write proves the
+		# tracer sees the device before the window counts. Pages dirtied
+		# through mmap (sqlite's wal-index) pass no write syscall and no
+		# ext4 write event: they surface at writeback only, as kworker on
+		# the inode -- so files come from inodes, and the writer from who
+		# holds the file open or mapped.
+		sec=${3:-300}; num "$sec" SEC
+		T=/sys/kernel/debug/tracing
+		[ -e "$T/events/ext4/enable" ] || die "ext4 tracepoints unavailable in this kernel"
+		dev=$(rootdev); n=$(devnum "$dev")
+		for e in ext4 jbd2 block/block_bio_queue; do
+			echo "dev == $n" > "$T/events/$e/filter" 2>/dev/null \
+				|| echo "note: $e refused the filter, tracing it unfiltered"
+			echo 1 > "$T/events/$e/enable"
+		done
+		echo > "$T/trace"
+		touch /.hibdbg.probe; rm -f /.hibdbg.probe; sleep 6   # past jbd2's 5s commit
+		p=$(grep -vc '^#' "$T/trace" || true)
+		[ "$p" -gt 0 ] || die "tracer blind: a probe write on $dev produced no event"
+		sync   # the probe's own metadata writeback would land inside the window
+		echo > "$T/trace"
+		sleep "$sec"
+		for e in ext4 jbd2 block/block_bio_queue; do
+			echo 0 > "$T/events/$e/enable"; echo 0 > "$T/events/$e/filter" 2>/dev/null || true
+		done
+		grep -v '^#' "$T/trace" > /tmp/hibsys.$$ || true
+		echo "$dev: $(grep -c block_bio_queue /tmp/hibsys.$$ || true) bios in ${sec}s (probe: $p events)"
+		echo "-- bios (issuer rwbs) --"
+		grep block_bio_queue /tmp/hibsys.$$ | awk '{print $1, $7}' | sort | uniq -c | sort -rn | head -10
+		echo "-- fs events (issuer event) --"
+		grep -v block_bio_queue /tmp/hibsys.$$ | grep -vE 'es_lookup|jbd2_(checkpoint|drop|run|handle_stats)' \
+		| awk '{print $1, $5}' | sort | uniq -c | sort -rn | head -25
+		echo "-- issuers still alive (pid cmd < parent) --"
+		# the ring names a thread (often just <...>); /proc names the app
+		grep -v es_lookup /tmp/hibsys.$$ | awk '{sub(/.*-/, "", $1); print $1}' | sort -un \
+		| while read -r pid; do w=$(whois "$pid"); [ -z "$w" ] || echo "  $pid $w"; done
+		echo "-- files (events inode path; holders indented: pid unit cmd) --"
+		# extent-status lookups also carry an ino but happen on reads too
+		grep -v es_lookup /tmp/hibsys.$$ | grep -o 'ino [0-9]*' | awk '$2!=8{print $2}' | sort | uniq -c | sort -rn | head -10 \
+		| while read -r c i; do
+			f=$(debugfs -R "ncheck $i" "$dev" 2>/dev/null | awk 'NR==2{print $2}')
+			echo "$c $i ${f:-(unlinked)}"
+			[ -z "$f" ] || holders "$f"
+		done
+		grep -q block_bio_queue /tmp/hibsys.$$ || echo "(system partition quiet: nothing reached $dev)"
+		rm -f /tmp/hibsys.$$ ;;
 	forks)	# name the daemon spawning short-lived helpers (def sg_raw).
 		# /proc sampling loses the ~ms race; fork/exec tracepoints catch
 		# every spawn and give the parent chain
@@ -1143,32 +1219,32 @@ fix)	case "${2:-}" in
 			systemctl start "$u" 2>/dev/null || true
 		done
 		echo "indexing restored" ;;
-	logs)	# bind /var/log onto the SSD volume: the log files and log DBs
-		# DSM writes there are what keeps the system partition -- and so
-		# every HDD -- busy. Reversible; absent the bind (boot task
-		# missed) DSM logs to md0 as stock, nothing rolls back.
-		dir=$(varlog_dir)
+	logs)	# bind DSM's md0 log stores (LOGDIRS) onto the SSD volume: the
+		# log files and log DBs DSM writes there are what keeps the system
+		# partition -- and so every HDD -- busy. Reversible; absent the
+		# bind (boot task missed) DSM logs to md0 as stock, nothing rolls
+		# back.
 		case "${3:-}" in
-		on)	if grep -q ' /var/log ' /proc/mounts; then
-				echo "already mounted: $(awk '$2=="/var/log"{print $1}' /proc/mounts)"
-			else
+		on)	for d in $LOGDIRS; do
+				dir=$(logs_dir "$d")
+				if logs_mounted "$d"; then echo "$d: already mounted"; continue; fi
 				mkdir -p "$dir"
 				# seed once: the log daemons expect their DBs to exist
-				[ -n "$(ls -A "$dir")" ] || cp -a /var/log/. "$dir/"
-				mount --bind "$dir" /var/log
-				echo "/var/log -> $dir"
-			fi
-			varlog_reopen ;;
-		off)	grep -q ' /var/log ' /proc/mounts || { echo "not mounted"; exit 0; }
-			umount /var/log && echo "/var/log back on md0 (copy kept in $dir)"
-			varlog_reopen ;;
-		status)	if grep -q ' /var/log ' /proc/mounts; then
-				echo "on: /var/log -> $dir"
-			else
-				echo "off: /var/log on md0"
-			fi
-			stale=$(varlog_stale)
-			[ -z "$stale" ] || echo "still on the previous copy: $(echo "$stale" | tr '\n' ' ')" ;;
+				[ -n "$(ls -A "$dir")" ] || cp -a "$d/." "$dir/"
+				mount --bind "$dir" "$d"
+				echo "$d -> $dir"
+			done
+			logs_reopen ;;
+		off)	for d in $LOGDIRS; do
+				logs_mounted "$d" || { echo "$d: not mounted"; continue; }
+				umount "$d" && echo "$d back on md0 (copy kept in $(logs_dir "$d"))"
+			done
+			logs_reopen ;;
+		status)	for d in $LOGDIRS; do
+				logs_mounted "$d" && echo "on:  $d -> $(logs_dir "$d")" || echo "off: $d on md0"
+			done
+			stale=$(logs_stale)
+			[ -z "$stale" ] || printf 'still on the previous copy (pid unit file):\n%s\n' "$stale" ;;
 		*)	die "usage: hibdbg fix logs on|off|status" ;;
 		esac ;;
 	swap)	# md1 (swap) is mirrored on the HDDs like md0: any paging is a

@@ -193,7 +193,7 @@ standby log shows the drives reaching their idle timer regularly with the
 system partition on them. `md0` is a contributor, not the blocker, and the
 wake attribution names the real ones.
 
-## Fix 6: `/var/log` on the SSD (`fix logs on`)
+## Fix 6: DSM's log stores on the SSD (`fix logs on`)
 
 With every app-level writer scheduled or disabled, two-hour recordings still
 showed the same residual: `synostgd-disk` writing `.SYNODISKDB`, `synologaccd`
@@ -203,15 +203,29 @@ every HDD. One 4 KB sqlite WAL write ended a 24-minute standby. `fix calm`
 cannot batch these: sqlite `fsync`s its WAL, which forces the journal out
 regardless of the commit interval.
 
-`fix logs on` bind-mounts `/var/log` onto `<vol>/@varlog` on the SSD volume
-holding the script, seeds it once from the md0 copy, and restarts the
-services still holding files on the old copy (found generically: any
-service in any slice, packages included, with an fd under `/var/log` on the
-wrong device).
-Reversible with `fix logs off`; if the boot task misses, DSM simply logs to
-md0 as stock. The bind cannot happen before the volume is mounted, which is
-after syslog-ng starts — hence the restart step rather than a systemd
-ordering. See ADR 7.
+`fix logs on` bind-mounts each directory in the script's `LOGDIRS` list
+(`/var/log`, `/var/lib/diskutil`) onto `<vol>/@<path-with-dashes>` on the
+SSD volume holding the script, seeds it once from the md0 copy, and restarts
+the services still holding files on the old copy — found generically: any
+service, in any slice, with an fd under a log dir on the wrong device. On
+this NAS that was the system syslog-ng, Log Center's own syslog-ng, nginx,
+smbd, nmbd and rsyncd; `fix logs status` lists every stale handle with pid,
+unit and file. Reversible with `fix logs off`; if the boot task misses, DSM
+simply logs to md0 as stock. The bind cannot happen before the volume is
+mounted, which is after syslog-ng starts — hence the restart step rather
+than a systemd ordering. See ADR 7.
+
+`/var/lib/diskutil` is there because of what `/var/log` alone left behind:
+md0 still took ~20 writes per 10 minutes with zero ext4 write or fsync
+events. `who sys` traces ext4, jbd2 and the bios of the root device with the
+filter applied in the kernel (an unfiltered ring is overrun by the volumes
+within a minute, and the few md0 events are lost — which is how the first
+attempts saw "nothing"), proves itself with a probe write, and resolves
+inodes to paths and paths to holders. The writer was Log Center's syslog-ng
+flushing the mmap'd wal-index of its connection-log sqlite: mmap dirtying
+passes no write syscall, so only writeback shows it, as `kworker` on the
+inode. Any future residual goes the same way: `who sys`, then the directory
+joins `LOGDIRS`. See ADR 9.
 
 ## Fix 2: the native idle timer — a documented dead end
 
@@ -338,7 +352,8 @@ all five. Post-update ritual: `status` (shim/daemon/timer health).
     status         health page; subverbs state, live [s], lcc [s], map,
                    audit, disks, probe
     who            attribution: who [pat] [s], who rq [s],
-                   who forks [s] [comm], who fresh [min] [path]
+                   who forks [s] [comm], who fresh [min] [path],
+                   who sys [s]
     rec            long recording: rec [s], rec stop, rec sum DIR,
                    rec wakes DIR, rec who DIR COMM
     sleepnow       forced-standby acceptance test: sleepnow [s] [nopoll]
@@ -356,7 +371,7 @@ all five. Post-update ritual: `status` (shim/daemon/timer health).
 
 | Change | Undo |
 |---|---|
-| `/var/log` on the SSD (`fix logs on`) | `fix logs off` (copy kept in `<vol>/@varlog`); any reboot also reverts it |
+| Log stores on the SSD (`fix logs on`) | `fix logs off` (copies kept in `<vol>/@var-log`, `<vol>/@var-lib-diskutil`); any reboot also reverts it |
 | Swap released (`fix swap off`) | `fix swap on`; any reboot also reverts it |
 | Poll shim (`fix shim on`) | `fix shim off` (restores original binary); any reboot also reverts it |
 | `sleepd` | `fix sleepd stop`; delete the boot task to stop re-asserting |

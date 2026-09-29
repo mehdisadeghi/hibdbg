@@ -342,11 +342,12 @@ client that asked. See ADR 5.
 
 Notification reuses Synology's own mail rather than duplicating SMTP
 credentials: DSM 7 exposes no CLI to its configured mailer (ssmtp.conf
-ships empty), but Task Scheduler mails a task's output. A daily root task
-running `watch digest` + "Send run details by email" is the digest channel
-(default). `watch mode perwake` additionally pushes a DSM notification
-(desktop + mobile app) the minute a wake is detected, for live debugging.
-See ADR 2.
+ships empty), but Task Scheduler mails a task's output. A root task running
+`watch digest` with "Send run details by email" is the mail channel; after
+each wake episode the daemon runs it (`watch mail <task>`), when the drives
+are already spinning. The task itself stays disabled: its own schedule would
+fire while the drives sleep and wake them. `watch mode perwake` additionally
+pushes a DSM notification (desktop + mobile app). See ADR 2 and ADR 11.
 
 ## Boot task: the whole stack self-heals
 
@@ -408,7 +409,7 @@ all five. Post-update ritual: `status` (shim/daemon/timer health).
 | Idle timer (`hib MIN`) | `hib undo` |
 | Indexing off (`fix quiesce`) | `fix unquiesce` |
 | Commit batching (`fix calm`/`fix calm3`) | `fix calm off` / `fix calm3 off` |
-| Wake notifications (`watch`) | `watch stop`; delete the digest mail task |
+| Wake notifications (`watch`) | `watch stop`; `watch mail off`; delete the mail task |
 | Whole stack | remove the Task Scheduler entry and reboot: DSM restores everything itself |
 
 ## Closing notes

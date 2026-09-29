@@ -11,6 +11,7 @@ SLEEPLOG=$RECBASE/sleepd.log
 WLOG=$RECBASE/watch.log
 WMODE=$RECBASE/.watch_mode
 WMARK=$RECBASE/.watch_mark
+WTASK=$RECBASE/.watch_task
 WGEN=$RECBASE/.watch_gen
 RUNDIR=/run/hibdbg
 WPID=$RUNDIR/watch.pid
@@ -291,8 +292,15 @@ forkchain() {
 watch_strings() {
 	local s=/usr/syno/synoman/webman/texts/enu/strings
 	grep -q '^\[hibdbg\]' "$s" 2>/dev/null && return 0
-	printf '\n[hibdbg]\nwake_title\t=\t"hibdbg: HDD wake"\nwake_msg\t=\t"A sleeping HDD received commands; details in watch.log and the daily digest mail."\ntest_title\t=\t"hibdbg: test notification"\n' >> "$s"
+	printf '\n[hibdbg]\nwake_title\t=\t"hibdbg: HDD wake"\nwake_msg\t=\t"A sleeping HDD received commands; details in watch.log and the wake mail."\ntest_title\t=\t"hibdbg: test notification"\n' >> "$s"
 	echo "registered notification strings in $s"
+}
+
+# Task Scheduler ids change when a task is recreated; the name is stable
+task_id() { # task_id NAME -> prints the id of the DSM task named NAME
+	synoschedtask --get | awk -v n="[$1]" '
+		$1 == "ID:" { id = $2; gsub(/[][]/, "", id) }
+		$1 == "Name:" { sub(/^ *Name: /, ""); if ($0 == n) { print id; exit } }'
 }
 
 # sample kernel ring buffer for N sec with syslog-ng paused (no disk feedback)
@@ -348,6 +356,7 @@ test
 notify
   watch start|stop|status      wake-notify daemon: log who woke the drives
   watch mode [digest|perwake]  show or set the notification mode
+  watch mail [TASK|off]        show or set the task mailing each wake
   watch digest                 wake episodes since last digest (mail body)
   watch test                   append a test episode, send a notification
 
@@ -471,7 +480,8 @@ syslog-ng is paused for the window. Do not run other hibdbg commands meanwhile.
 EOF
 	;;
 	watch) cat <<'EOF'
-usage: hibdbg watch start|stop|status | mode [digest|perwake] | digest | test
+usage: hibdbg watch start|stop|status | mode [digest|perwake] | mail [TASK|off]
+                   | digest | test
 
 Wake-notify daemon. Keeps a private ftrace instance armed on the sata queues
 (RAM only, zero disk I/O, coexists with rec and who), checks drive state once
@@ -496,19 +506,23 @@ the queue named is also resolved through /proc at wake time -- cmdline, parent
 and docker container -- and nfsd, a kernel thread, additionally logs the NFS
 client that asked.
 
-  mode digest   (default) episodes only collect in watch.log. For the daily
-                mail, create a DSM task that Synology mails with its own
-                configured email -- Control Panel > Task Scheduler > Create >
-                Scheduled task > user root, daily:
-                    /path/to/hibdbg.sh watch digest
-                and enable "Send run details by email" in its settings.
+  mode digest   (default) episodes only collect in watch.log and go out by
+                mail (see mail).
   mode perwake  additionally push a DSM notification (desktop bell + mobile
                 app) the minute a wake is detected -- for live debugging.
                 The push text is static (synodsmnotify accepts only i18n
                 string keys, registered by watch start); who/why is in
-                watch.log. Per-wake email is deliberately absent: DSM
-                exposes no CLI to its configured SMTP, and duplicating mail
-                credentials into the tool is worse than the digest.
+                watch.log and the mail.
+  mail TASK     after each wake episode, run the DSM task named TASK, which
+                Synology mails with its own configured email. The drives are
+                awake by then, so the mail costs no wake. Create it once --
+                Control Panel > Task Scheduler > Create > Scheduled task >
+                user root, command:
+                    /path/to/hibdbg.sh watch digest
+                settings: "Send run details by email" + "only when the script
+                terminates abnormally"; then disable the task: a scheduled
+                run fires while the drives sleep and wakes them.
+  mail off      stop mailing; episodes only collect in watch.log.
 
   digest        print episodes appended since the previous digest call and
                 advance the marker (the mail task's output is the email
@@ -1422,9 +1436,7 @@ watch)	case "${2:-}" in
 		fi
 		setsid "$0" _watch >/dev/null 2>&1 < /dev/null &
 		echo "watch started (mode: $(cat "$WMODE" 2>/dev/null || echo digest); episodes -> $WLOG)"
-		echo "daily digest mail: Task Scheduler > Create > Scheduled task > root, daily:"
-		echo "  $(readlink -f "$0") watch digest"
-		echo "  + task settings: Send run details by email" ;;
+		[ -f "$WTASK" ] || echo "no wake mail set: see hibdbg watch --help (mail)" ;;
 	stop)	if pid=$(alive "$WPID" _watch); then
 			kill "$pid" && echo "stopped (pid $pid)"
 		else
@@ -1433,6 +1445,7 @@ watch)	case "${2:-}" in
 	status)	pid=$(alive "$WPID" _watch) \
 			&& echo "running (pid $pid)" || echo "not running"
 		echo "mode: $(cat "$WMODE" 2>/dev/null || echo digest)"
+		echo "mail: $(cat "$WTASK" 2>/dev/null || echo off)"
 		fm=/sys/kernel/debug/tracing/instances/hibread/events/filemap
 		if [ -d "$fm/mm_filemap_add_to_page_cache" ]; then
 			echo "read attribution: available ($(cat "$fm/mm_filemap_add_to_page_cache/enable") = armed while asleep)"
@@ -1446,6 +1459,13 @@ watch)	case "${2:-}" in
 		digest|perwake)
 			echo "$3" > "$WMODE"; echo "mode: $3" ;;
 		*)	die "usage: hibdbg watch mode [digest|perwake]" ;;
+		esac ;;
+	mail)	case "${3:-}" in
+		"")	cat "$WTASK" 2>/dev/null || echo off ;;
+		off)	rm -f "$WTASK"; echo "mail: off" ;;
+		*)	id=$(task_id "$3")
+			[ -n "$id" ] || die "no DSM task named '$3'"
+			echo "$3" > "$WTASK"; echo "mail: task '$3' (id $id)" ;;
 		esac ;;
 	digest)	[ -f "$WLOG" ] || { echo "no wakes recorded yet"; exit 0; }
 		n=$(( $(cat "$WMARK" 2>/dev/null || echo 0) ))
@@ -1467,7 +1487,7 @@ watch)	case "${2:-}" in
 		printf '== %s TEST episode (watch test)\n' "$(date '+%F %T')" >> "$WLOG"
 		synodsmnotify @administrators hibdbg:test_title hibdbg:wake_msg \
 			&& echo "dsm notification sent; test episode appended to $WLOG" ;;
-	*)	die "usage: hibdbg watch start|stop|status|mode|digest|test" ;;
+	*)	die "usage: hibdbg watch start|stop|status|mode|mail|digest|test" ;;
 	esac ;;
 
 _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
@@ -1545,6 +1565,13 @@ _watch)	# wake-notify daemon: a private ftrace instance on the sata queues
 					# i18n keys only: the push is static, details in the log
 					synodsmnotify @administrators hibdbg:wake_title \
 						hibdbg:wake_msg 2>/dev/null || true
+				fi
+				if [ -f "$WTASK" ]; then
+					# check_status=0: the task stays disabled so its
+					# own schedule never fires while the drives sleep
+					id=$(task_id "$(cat "$WTASK")") && [ -n "$id" ] \
+						&& synoschedtask --run id="$id" check_time=0 \
+						check_status=0 || true
 				fi
 			fi
 		else

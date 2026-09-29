@@ -1,5 +1,34 @@
 # Architecture decisions
 
+## ADR 11: wake mail is sent by the daemon, not by a schedule
+
+2026-09-29
+
+### Context
+
+ADR 2 mailed the digest from a daily Task Scheduler task. A wake reached the
+inbox up to a day late, and the scheduled run itself woke the drives:
+`synoschedtask` headed the 00:00 episodes. Polling more often buys latency
+with wakes, against the project's goal.
+
+### Decision
+
+After appending an episode, the `watch` daemon runs the mail task on demand
+(`synoschedtask --run id=N check_time=0 check_status=0`). The drives are
+spinning at that point, so the mail costs no wake. The task stays disabled;
+`check_status=0` runs it anyway (verified: disabled task, mail delivered).
+`watch mail <task>` stores the task's name, resolved to its id at each wake,
+since ids change when a task is recreated.
+
+### Consequences
+
+- One mail per wake episode, carrying every episode since the last digest;
+  at most one a minute, as episodes are.
+- No scheduled backstop: while the daemon is down, episodes are not written
+  either, so nothing goes unmailed.
+- Supersedes ADR 2's "per-wake email is deliberately not implemented"; the
+  mail still goes through DSM's own configured SMTP.
+
 ## ADR 10: system-partition reads move to SSD mirrors; the HDD members stay
 
 2026-09-18
